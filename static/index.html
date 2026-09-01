@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AdaptaBrasil - Mapa de Indicadores</title>
+<link href="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.css" rel="stylesheet">
+<style>
+  html, body { margin: 0; height: 100%; font-family: system-ui, Arial, sans-serif; }
+  #app { display: flex; flex-direction: column; height: 100vh; }
+  #filters {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 12px 16px;
+    background: #f4f4f4;
+    border-bottom: 1px solid #ddd;
+  }
+  .filters-row {
+    display: flex;
+    align-items: flex-end;
+    gap: 24px;
+    flex-wrap: wrap;
+  }
+  .field { display: flex; flex-direction: column; min-width: 220px; }
+  .field label { font-size: 13px; font-weight: 600; margin-bottom: 4px; color: #333; }
+  select {
+    font-size: 14px;
+    padding: 6px 8px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    background: #fff;
+  }
+  #loadMap {
+    font-size: 14px;
+    font-weight: 600;
+    padding: 8px 22px;
+    border: none;
+    border-radius: 4px;
+    background: #1e6f42;
+    color: #fff;
+    cursor: pointer;
+  }
+  #loadMap:disabled { background: #a9a9a9; cursor: not-allowed; }
+  #loadStatus { font-size: 13px; color: #555; align-self: center; }
+  #map { flex: 1; width: 100%; }
+  .maplibregl-popup-content { font-size: 13px; padding: 8px 10px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="filters">
+    <div class="filters-row">
+      <div class="field">
+        <label for="sep">Setor estratégico</label>
+        <select id="sep"><option value="">(selecione)</option></select>
+      </div>
+      <div class="field">
+        <label for="indicator">Indicador</label>
+        <select id="indicator" disabled><option value="">(selecione)</option></select>
+      </div>
+    </div>
+    <div class="filters-row">
+      <div class="field">
+        <label for="state">Estado</label>
+        <select id="state"><option value="">(selecione)</option></select>
+      </div>
+      <div class="field">
+        <label for="county">Município</label>
+        <select id="county" disabled><option value="">(selecione)</option></select>
+      </div>
+      <div class="field">
+        <button id="loadMap" disabled>Exibir mapa</button>
+      </div>
+      <div class="field">
+        <span id="loadStatus"></span>
+      </div>
+    </div>
+  </div>
+  <div id="map"></div>
+</div>
+<script src="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
