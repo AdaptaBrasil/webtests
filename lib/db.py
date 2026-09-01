@@ -46,7 +46,7 @@ def query_df(sql, params=None):
 def fetch_seps():
     """Return id/name of every strategic sector, ordered by order_by."""
     schema = get_schema()
-    sql = f"select id, name from {schema}.sep where id = 9 order by order_by"
+    sql = f"select id, name from {schema}.sep where id = 10 order by order_by"
     return query_df(sql)
 
 
