@@ -20,6 +20,8 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 
 @app.get("/")
+@app.get("/webtests")
+@app.get("/webtests/")
 def index():
     return FileResponse(STATIC_DIR / "index.html")
 
