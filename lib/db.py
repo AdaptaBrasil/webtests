@@ -94,14 +94,14 @@ def fetch_geovalues(indicator_id, state_id, county_id=None):
     params = {"indicator_id": indicator_id}
     if county_id:
         sql = (
-            f"select indicator_id, state_id, county_id, value, color, geompropertiesasjson "
+            f"select indicator_id, state_id, county_id, county_name, name, value, color, geompropertiesasjson "
             f"from {schema}.geovalue "
             f"where indicator_id = :indicator_id and year < 2027 and county_id = :county_id"
         )
         params["county_id"] = county_id
     else:
         sql = (
-            f"select gv.indicator_id, gv.state_id, gv.county_id, gv.value, gv.color, "
+            f"select gv.indicator_id, gv.state_id, gv.county_id, gv.county_name, gv.name, gv.value, gv.color, "
             f"       ST_AsGeoJSON(ST_SimplifyPreserveTopology(go.geom, :tolerance), 4) as geompropertiesasjson "
             f"from {schema}.geovalue gv "
             f"join {schema}.geoobject go on go.id = gv.geoobject_id "

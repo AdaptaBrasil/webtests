@@ -153,8 +153,13 @@ function ensureMap() {
 
       map.on('mousemove', 'geovalue-fill', (e) => {
         map.getCanvas().style.cursor = 'pointer';
-        const value = e.features[0].properties.value;
-        popup.setLngLat(e.lngLat).setHTML(`<strong>Valor:</strong> ${value}`).addTo(map);
+        const { county_name, name, value } = e.features[0].properties;
+        const html = [
+          `<strong>Município:</strong> ${county_name}`,
+          `<strong>Nome:</strong> ${name}`,
+          `<strong>Valor:</strong> ${Number(value).toFixed(4)}`
+        ].join('<br>');
+        popup.setLngLat(e.lngLat).setHTML(html).addTo(map);
       });
       map.on('mouseleave', 'geovalue-fill', () => {
         map.getCanvas().style.cursor = '';
