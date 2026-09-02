@@ -182,6 +182,7 @@ async function loadMapData() {
 
   loadButton.disabled = true;
   loadStatus.textContent = 'Carregando mapa...';
+  const startTime = performance.now();
   try {
     const res = await fetch(`/api/geovalues?${params.toString()}`);
     const geojson = await res.json();
@@ -192,7 +193,8 @@ async function loadMapData() {
     const bounds = computeBounds(geojson);
     if (bounds) readyMap.fitBounds(bounds, { padding: 40, duration: 500 });
 
-    loadStatus.textContent = `${geojson.features.length} polígonos carregados`;
+    const seconds = Math.round((performance.now() - startTime) / 1000);
+    loadStatus.textContent = `${geojson.features.length} polígonos carregados em ${seconds} seg`;
   } catch (err) {
     loadStatus.textContent = 'Erro ao carregar o mapa';
     throw err;
