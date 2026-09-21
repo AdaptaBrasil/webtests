@@ -2,7 +2,7 @@ services:
   app:
     build: .
     ports:
-      - "8000:8000"
+      - "8081:8000"    # HOST:CONTAINER
     env_file:
       - .env
     restart: unless-stopped
