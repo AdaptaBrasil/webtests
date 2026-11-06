@@ -1,3 +1,4 @@
+import hashlib
 from pathlib import Path
 from typing import Optional
 
@@ -7,13 +8,30 @@ load_dotenv(override=True)
 
 from fastapi import BackgroundTasks, FastAPI, Query
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from lib import db
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
+
+
+def _render_index():
+    """index.html with app.js's URL tagged by a hash of its contents
+    (/static/app.js?v=<hash>), so a deploy that changes app.js gives it a new
+    URL and browsers can't keep running a cached old copy. Computed once at
+    startup; restart the server after changing either file.
+    """
+    app_js_hash = hashlib.sha256((STATIC_DIR / "app.js").read_bytes()).hexdigest()[:12]
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    tag = '<script src="/static/app.js"></script>'
+    if tag not in html:
+        raise RuntimeError(f"index.html must contain {tag!r} to version app.js")
+    return html.replace(tag, f'<script src="/static/app.js?v={app_js_hash}"></script>')
+
+
+INDEX_HTML = _render_index()
 
 app = FastAPI(title="AdaptaBrasil - Mapa de Indicadores")
 app.add_middleware(GZipMiddleware, minimum_size=1000)
@@ -23,7 +41,9 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 @app.get("/adaptabrasil_webtests")
 @app.get("/adaptabrasil_webtests/")
 def index():
-    return FileResponse(STATIC_DIR / "index.html")
+    # no-cache: browsers revalidate the page on every visit, so they always
+    # see the current app.js version below.
+    return HTMLResponse(INDEX_HTML, headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/api/seps")
