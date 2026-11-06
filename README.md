@@ -71,9 +71,21 @@ the app on http://localhost:8000.
 | `GET /api/indicators`  | `sep_id`                                        | List indicators for a sector                   |
 | `GET /api/states`      | —                                               | List states                                    |
 | `GET /api/counties`    | `state_id`                                      | List counties for a state                      |
-| `GET /api/geovalues`   | `indicator_id`, `state_id`, `county_id` (opt.)  | GeoJSON `FeatureCollection` of indicator values |
+| `GET /api/geometry`   | `state_id`, `county_id` (opt.)                  | GeoJSON `FeatureCollection` of the geoobjects' boundaries (feature `id` = geoobject id; `name`, `county_name` properties) |
+| `GET /api/values`     | `indicator_id`, `state_id`, `county_id` (opt.)  | Indicator values and legend colors (`geoobject_id`, `value`, `color`), no geometry |
+| `POST /api/warm`      | `state_id`, `county_id` (opt.)                  | Reads the area's values in the background so later `/api/values` calls are fast; returns 202 immediately |
 
-For `/api/geovalues` without `county_id` (state-wide view), geometry is
+Geometry and values are served separately: boundaries don't change between
+indicators, so `/api/geometry` is cached (in server memory and by the browser)
+and the frontend only redraws it when the state/county changes. Switching
+indicators fetches just `/api/values`, which the map joins to the features by
+`geoobject_id` and applies as MapLibre feature-state.
+
+When a state or county is picked, the frontend calls `/api/warm` and prefetches
+`/api/geometry`, so the first map for an area doesn't wait on cold disk reads.
+Warming the same area again within 15 minutes is a no-op.
+
+For `/api/geometry` without `county_id` (state-wide view), geometry is
 simplified server-side (`ST_SimplifyPreserveTopology`) since state views can
 include tens of thousands of sub-county polygons; county-scoped requests are
 served at full resolution.

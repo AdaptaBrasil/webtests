@@ -5,9 +5,9 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-from fastapi import FastAPI, Query
+from fastapi import BackgroundTasks, FastAPI, Query
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from lib import db
@@ -46,13 +46,44 @@ def api_counties(state_id: int = Query(...)):
     return db.fetch_counties(state_id).to_dict(orient="records")
 
 
-@app.get("/api/geovalues")
-def api_geovalues(
+@app.get("/api/geometry")
+def api_geometry(
+    state_id: int = Query(...),
+    county_id: Optional[int] = Query(None),
+):
+    # Geoobject boundaries don't change between indicators, so let the browser
+    # cache them too.
+    return Response(
+        content=db.fetch_geometry_geojson(state_id, county_id),
+        media_type="application/json",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+@app.get("/api/values")
+def api_values(
     indicator_id: int = Query(...),
     state_id: int = Query(...),
     county_id: Optional[int] = Query(None),
 ):
-    return db.fetch_geovalues_geojson(indicator_id, state_id, county_id)
+    return db.fetch_values(indicator_id, state_id, county_id)
+
+
+@app.post("/api/warm", status_code=202)
+def api_warm(
+    background_tasks: BackgroundTasks,
+    state_id: int = Query(...),
+    county_id: Optional[int] = Query(None),
+):
+    # Returns immediately; the read runs after the response is sent.
+    background_tasks.add_task(db.warm_values, state_id, county_id)
+    return {"status": "warming"}
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="127.0.0.1", port=8000)

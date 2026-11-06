@@ -1,6 +1,6 @@
 import os
-import json
-import math
+import threading
+import time
 from functools import lru_cache
 
 import pandas as pd
@@ -28,7 +28,12 @@ def get_engine(echo=False):
     password = _require("DB_PASSWORD")
 
     url = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{dbname}"
-    return create_engine(url, echo=echo)
+    # The DB role's default search_path doesn't include `public`, where the
+    # PostGIS functions (ST_AsGeoJSON, ST_SimplifyPreserveTopology, ...) live.
+    search_path = f"{get_schema()},public"
+    return create_engine(
+        url, echo=echo, connect_args={"options": f"-csearch_path={search_path}"}
+    )
 
 
 @lru_cache(maxsize=1)
@@ -83,49 +88,144 @@ def fetch_counties(state_id):
 STATE_VIEW_SIMPLIFY_TOLERANCE = 0.0005
 
 
-def fetch_geovalues(indicator_id, state_id, county_id=None):
-    """Return the geovalue rows matching the given filters, geometry included.
+def _scope_filter(state_id, county_id, alias):
+    """WHERE clause + params limiting geoobjects to a state, or to one county.
 
     county_id is unique across states, so when it's given it's sufficient on
-    its own -- state_id is only used to scope the query when no county_id is
-    provided.
+    its own -- state_id is only used when no county_id is provided.
+    """
+    if county_id:
+        return f"{alias}.county_id = :county_id", {"county_id": county_id}
+    return f"{alias}.state_id = :state_id", {"state_id": state_id}
+
+
+@lru_cache(maxsize=32)
+def fetch_geometry_geojson(state_id, county_id=None):
+    """Return the geoobjects of a state (or of one county) as a GeoJSON
+    FeatureCollection string. Each feature's id is its geoobject id, and its
+    properties carry the labels shown on hover (name, county_name), which
+    don't depend on the indicator.
+
+    Geometry doesn't depend on the indicator, so it's fetched once per
+    state/county and cached; indicator values are fetched separately by
+    fetch_values() and joined to these features by id on the client.
+    The JSON is built by Postgres and cached already serialized, so cache hits
+    skip both the database and Python-side JSON encoding.
     """
     schema = get_schema()
-    params = {"indicator_id": indicator_id}
+    where, params = _scope_filter(state_id, county_id, "g")
     if county_id:
-        sql = (
-            f"select indicator_id, state_id, county_id, county_name, name, value, color, geompropertiesasjson "
-            f"from {schema}.geovalue "
-            f"where indicator_id = :indicator_id and year < 2027 and county_id = :county_id"
-        )
-        params["county_id"] = county_id
+        geom_sql = "ST_AsGeoJSON(g.geom, 6)"
     else:
-        sql = (
-            f"select gv.indicator_id, gv.state_id, gv.county_id, gv.county_name, gv.name, gv.value, gv.color, "
-            f"       ST_AsGeoJSON(ST_SimplifyPreserveTopology(go.geom, :tolerance), 4) as geompropertiesasjson "
-            f"from {schema}.geovalue gv "
-            f"join {schema}.geoobject go on go.id = gv.geoobject_id "
-            f"where gv.indicator_id = :indicator_id and gv.year < 2027 and gv.state_id = :state_id"
-        )
-        params["state_id"] = state_id
+        geom_sql = "ST_AsGeoJSON(ST_SimplifyPreserveTopology(g.geom, :tolerance), 4)"
         params["tolerance"] = STATE_VIEW_SIMPLIFY_TOLERANCE
-    return query_df(sql, params)
+    # name/county_name are built the same way as in the geovalue view.
+    sql = (
+        f"select json_build_object("
+        f"  'type', 'FeatureCollection',"
+        f"  'features', coalesce(json_agg(json_build_object("
+        f"    'type', 'Feature', 'id', g.id,"
+        f"    'properties', json_build_object("
+        f"      'name', case when g.state is null then g.name::text"
+        f"                   else concat(g.name, '/', g.state) end,"
+        f"      'county_name', c.name),"
+        f"    'geometry', {geom_sql}::json"
+        f"  )), '[]'::json)"
+        f")::text as fc "
+        f"from {schema}.geoobject g "
+        f"left join {schema}.geoobject c on c.id = g.county_id "
+        f"where {where} and g.geom is not null"
+    )
+    with get_engine().connect() as conn:
+        return conn.execute(text(sql), params).scalar_one()
 
 
-def fetch_geovalues_geojson(indicator_id, state_id, county_id=None):
-    """Return the filtered geovalue rows as a GeoJSON FeatureCollection dict."""
-    df = fetch_geovalues(indicator_id, state_id, county_id)
+def fetch_values(indicator_id, state_id, county_id=None):
+    """Return the indicator's values and legend colors for a state or county,
+    as rows of geoobject_id, value, color (no geometry or labels).
 
-    features = []
-    for row in df.to_dict(orient="records"):
-        geometry = row.pop("geompropertiesasjson")
-        if isinstance(geometry, str):
-            geometry = json.loads(geometry)
-        if isinstance(geometry, dict) and geometry.get("type") == "Feature":
-            geometry = geometry.get("geometry")
-        for key, val in row.items():
-            if isinstance(val, float) and math.isnan(val):
-                row[key] = None
-        features.append({"type": "Feature", "geometry": geometry, "properties": row})
+    Reads the base `value` table rather than the `geovalue` materialized view:
+    geovalue repeats each geoobject's geometry JSON in every row, so the rows
+    for one indicator/state are scattered over ~24 GB and cost one disk read
+    each (~10-18 s cold). `value` is narrow, and its rows for a geoobject
+    (all indicators) sit together, so this takes ~0.1 s. The joins mirror the
+    view's: rows without a matching legend item or county are left out.
+    The MATERIALIZED CTEs pin the plan to "geoobjects of the state first,
+    then their values" -- left alone, the planner picks a plan ~100x slower.
+    The geoobjects are looked up in id order (sorted CTE + LATERAL) so the
+    probes walk value_geoobject_covering_idx (geoobject_id, indicator_id,
+    year) INCLUDE (value) front to back: with hash order (`IN (...)`) each
+    probe was a random read, ~10 ms apiece on this server when cold.
+    """
+    schema = get_schema()
+    where, params = _scope_filter(state_id, county_id, "g")
+    params["indicator_id"] = indicator_id
+    sql = (
+        f"with objs as materialized ("
+        f"  select distinct g.id from {schema}.geoobject g "
+        f"  where {where} and g.county_id is not null order by g.id"
+        f"), vals as materialized ("
+        f"  select v.geoobject_id, v.value from objs "
+        f"  cross join lateral ("
+        f"    select v.geoobject_id, v.value from {schema}.value v "
+        f"    where v.geoobject_id = objs.id "
+        f"      and v.indicator_id = :indicator_id and v.year < 2027"
+        f"  ) v"
+        f") "
+        f"select vals.geoobject_id, vals.value, li.color from vals "
+        f"join {schema}.legend_items li "
+        f"  on li.legend_id = (select legend_id from {schema}.indicator where id = :indicator_id) "
+        f" and (vals.value >= li.minvalue and vals.value < li.maxvalue "
+        f"      or vals.value is null and li.minvalue is null)"
+    )
+    df = query_df(sql, params)
+    # NaN isn't valid JSON; send missing values as null.
+    return df.astype(object).where(df.notna(), None).to_dict(orient="records")
 
-    return {"type": "FeatureCollection", "features": features}
+
+# Areas warmed recently (key -> monotonic time) and areas being warmed now,
+# so repeated selections of the same state don't queue duplicate reads.
+WARM_TTL_SECONDS = 15 * 60
+_warmed_at = {}
+_warming = set()
+_warm_lock = threading.Lock()
+
+
+def warm_values(state_id, county_id=None):
+    """Read every indicator's values for a state (or county) so the database
+    pulls those pages into memory before the user asks for a map.
+
+    The first fetch_values() for an area costs one random disk read per
+    geoobject; afterwards every indicator for that area is fast, because a
+    geoobject's rows for all indicators are stored together. Running this in
+    the background when the area is picked hides that first read. It reads the
+    same rows as fetch_values() (all indicators, year < 2027), in the same
+    id order, so it warms the same index pages. No-op if the area was warmed in
+    the last WARM_TTL_SECONDS or is being warmed now.
+    """
+    key = (None, county_id) if county_id else (state_id, None)
+    with _warm_lock:
+        last = _warmed_at.get(key)
+        if key in _warming or (last and time.monotonic() - last < WARM_TTL_SECONDS):
+            return
+        _warming.add(key)
+    try:
+        schema = get_schema()
+        where, params = _scope_filter(state_id, county_id, "g")
+        sql = (
+            f"with objs as materialized ("
+            f"  select distinct g.id from {schema}.geoobject g "
+            f"  where {where} and g.county_id is not null order by g.id"
+            f") "
+            f"select count(v.value) from objs cross join lateral ("
+            f"  select v.value from {schema}.value v "
+            f"  where v.geoobject_id = objs.id and v.year < 2027"
+            f") v"
+        )
+        with get_engine().connect() as conn:
+            conn.execute(text(sql), params).scalar_one()
+        with _warm_lock:
+            _warmed_at[key] = time.monotonic()
+    finally:
+        with _warm_lock:
+            _warming.discard(key)
