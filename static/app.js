@@ -666,7 +666,13 @@ async function loadBrasilMap(load) {
   renderLegend(indicatorSelect.selectedOptions[0].textContent, legend.data);
   if (currentAreaKey !== 'BR') readyMap.fitBounds(BRAZIL_BOUNDS, { padding: 20, duration: 500 });
   currentAreaKey = 'BR';
-  finishLoading(load.startTime, `${states.length.toLocaleString('pt-BR')} setores (Brasil)`);
+  // Both are loaded: municipalities are drawn below countyFillMaxZoom,
+  // tracts from it on.
+  finishLoading(
+    load.startTime,
+    `Brasil: ${countyStates.length.toLocaleString('pt-BR')} municípios e ` +
+      `${states.length.toLocaleString('pt-BR')} setores`
+  );
 }
 
 // --- State / municipality ----------------------------------------------------------
