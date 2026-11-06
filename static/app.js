@@ -4,9 +4,72 @@ const stateSelect = document.getElementById('state');
 const countySelect = document.getElementById('county');
 const loadButton = document.getElementById('loadMap');
 const loadStatus = document.getElementById('loadStatus');
+const debugCheckbox = document.getElementById('debug');
+const debugPanel = document.getElementById('debugPanel');
+const debugSql = document.getElementById('debugSql');
 
 let map = null;
 let mapReadyPromise = null;
+
+// --- Debug SQL ---------------------------------------------------------------
+// With "Debug" checked, every API request asks the server for the SQL it ran
+// (header X-Debug-SQL: 1). The server returns it, parameters merged in, as a
+// URL-encoded JSON list in the X-Debug-SQL response header; it's appended to
+// the debug memo, ready to paste into a SQL client.
+
+function appendDebugSql(label, statements) {
+  const block = [`-- ${label}  [${new Date().toLocaleTimeString()}]`, ...statements].join('\n');
+  debugSql.value += (debugSql.value ? '\n\n' : '') + block;
+  debugSql.scrollTop = debugSql.scrollHeight;
+}
+
+// Fetch JSON; returns { data, sql }. sql is the list of statements the server
+// ran (debug on), or null (debug off).
+async function apiFetch(url, options = {}) {
+  const debug = debugCheckbox.checked;
+  const headers = { ...(options.headers || {}) };
+  const init = { ...options, headers };
+  if (debug) {
+    headers['X-Debug-SQL'] = '1';
+    // Skip the browser's HTTP cache: a copy cached without debug carries no
+    // SQL, and in debug mode the point is to see the real request.
+    init.cache = 'no-cache';
+  }
+  const res = await fetch(url, init);
+  if (!res.ok) throw new Error(`${url} -> HTTP ${res.status}`);
+  const data = await res.json();
+  if (!debug) return { data, sql: null };
+  const rawSql = res.headers.get('X-Debug-SQL');
+  const sql = rawSql
+    ? JSON.parse(decodeURIComponent(rawSql))
+    : ['-- (o servidor não retornou SQL para esta requisição)'];
+  return { data, sql };
+}
+
+// Fetch JSON, logging the request's SQL to the debug memo.
+async function fetchJson(url, options = {}) {
+  const { data, sql } = await apiFetch(url, options);
+  if (sql) appendDebugSql(`${options.method || 'GET'} ${url}`, sql);
+  return data;
+}
+
+debugCheckbox.addEventListener('change', () => {
+  debugPanel.hidden = !debugCheckbox.checked;
+  // The panel can change the filter bar's height; let the map refit.
+  if (map) map.resize();
+});
+document.getElementById('debugClear').addEventListener('click', () => {
+  debugSql.value = '';
+});
+document.getElementById('debugCopy').addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText(debugSql.value);
+  } catch {
+    // Clipboard API needs HTTPS or localhost; fall back to selecting the text.
+    debugSql.select();
+    document.execCommand('copy');
+  }
+});
 
 function fillSelect(select, items, valueKey, labelKey, placeholder) {
   select.innerHTML = '';
@@ -28,8 +91,7 @@ function updateLoadButtonState() {
 }
 
 async function loadSeps() {
-  const res = await fetch('/api/seps');
-  const data = await res.json();
+  const data = await fetchJson('/api/seps');
   fillSelect(sepSelect, data, 'id', 'name', '(selecione)');
 }
 
@@ -38,15 +100,13 @@ async function loadIndicators(sepId) {
   indicatorSelect.disabled = true;
   if (!sepId) return;
 
-  const res = await fetch(`/api/indicators?sep_id=${encodeURIComponent(sepId)}`);
-  const data = await res.json();
+  const data = await fetchJson(`/api/indicators?sep_id=${encodeURIComponent(sepId)}`);
   fillSelect(indicatorSelect, data, 'id', 'name', '(selecione)');
   indicatorSelect.disabled = false;
 }
 
 async function loadStates() {
-  const res = await fetch('/api/states');
-  const data = await res.json();
+  const data = await fetchJson('/api/states');
   fillSelect(stateSelect, data, 'id', 'state', '(selecione)');
 }
 
@@ -56,8 +116,7 @@ async function loadCounties(stateId) {
     countySelect.disabled = true;
     return;
   }
-  const res = await fetch(`/api/counties?state_id=${encodeURIComponent(stateId)}`);
-  const data = await res.json();
+  const data = await fetchJson(`/api/counties?state_id=${encodeURIComponent(stateId)}`);
   fillSelect(countySelect, data, 'id', 'name', '(selecione)');
   countySelect.disabled = false;
 }
@@ -79,17 +138,19 @@ function areaParams() {
 
 function getGeometry(params) {
   const url = `/api/geometry?${params.toString()}`;
-  if (!geometryRequests.has(url)) {
-    const request = fetchJson(url);
+  // Keyed by debug mode too: a copy fetched without debug carries no SQL.
+  const key = `${debugCheckbox.checked}|${url}`;
+  if (!geometryRequests.has(key)) {
+    const request = apiFetch(url).then(({ data, sql }) => ({ data, sql, url }));
     // Drop failed requests so the next attempt retries.
-    request.catch(() => geometryRequests.delete(url));
-    geometryRequests.set(url, request);
+    request.catch(() => geometryRequests.delete(key));
+    geometryRequests.set(key, request);
     // Keep only the most recent areas; large states are several MB each.
     while (geometryRequests.size > MAX_CACHED_GEOMETRIES) {
       geometryRequests.delete(geometryRequests.keys().next().value);
     }
   }
-  return geometryRequests.get(url);
+  return geometryRequests.get(key);
 }
 
 // While the user is still choosing an indicator, have the server read the
@@ -98,7 +159,7 @@ function getGeometry(params) {
 function warmArea() {
   if (!stateSelect.value) return;
   const params = areaParams();
-  fetch(`/api/warm?${params.toString()}`, { method: 'POST' }).catch(() => {});
+  fetchJson(`/api/warm?${params.toString()}`, { method: 'POST' }).catch(() => {});
   getGeometry(params).catch(() => {});
 }
 
@@ -233,15 +294,11 @@ function ensureMap() {
 // Key ("state:county") of the geometry currently in the map's source, so
 // geometry is only fetched and redrawn when the state/county changes.
 let currentGeometryKey = null;
+// Debug: { url, sql } of the request that produced the geometry on the map.
+let currentGeometryDebug = null;
 let currentBounds = null;
 // geoobject_id -> {value, color} row for the indicator currently shown.
 let currentValues = new Map();
-
-async function fetchJson(url) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`${url} -> HTTP ${res.status}`);
-  return res.json();
-}
 
 function applyValues(readyMap, rows) {
   readyMap.removeFeatureState({ source: 'geoobjects' });
@@ -269,13 +326,30 @@ async function loadMapData() {
   loadStatus.textContent = 'Carregando mapa...';
   const startTime = performance.now();
   try {
-    const [geojson, rows, readyMap] = await Promise.all([
+    const valuesUrl = `/api/values?${valueParams.toString()}`;
+    const [geometry, values, readyMap] = await Promise.all([
       needGeometry ? getGeometry(scope) : null,
-      fetchJson(`/api/values?${valueParams.toString()}`),
+      apiFetch(valuesUrl),
       ensureMap()
     ]);
+    const rows = values.data;
+
+    if (needGeometry) currentGeometryDebug = { url: geometry.url, sql: geometry.sql };
+    if (debugCheckbox.checked) {
+      // Polygons first, then values -- the order the map uses them.
+      const g = currentGeometryDebug;
+      const note = needGeometry
+        ? '-- polígonos (baixados ao escolher a área ou agora)'
+        : '-- polígonos já exibidos no mapa; nenhuma requisição nova. Consulta que os gerou:';
+      appendDebugSql(`GET ${g ? g.url : '/api/geometry'}`, [
+        note,
+        ...((g && g.sql) || ['-- (carregados com o Debug desligado; recarregue a área para ver o SQL)'])
+      ]);
+      appendDebugSql(`GET ${valuesUrl}`, values.sql);
+    }
 
     if (needGeometry) {
+      const geojson = geometry.data;
       readyMap.getSource('geoobjects').setData(geojson);
       currentGeometryKey = geometryKey;
       currentBounds = computeBounds(geojson);

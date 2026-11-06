@@ -1,10 +1,12 @@
+import contextvars
 import os
 import threading
 import time
+from contextlib import contextmanager
 from functools import lru_cache
 
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 # Registers PostGIS geometry <-> SQLAlchemy type adapters (PostGIS access via
 # SQLAlchemy is required by the project even though these routines only read
 # already-serialized GeoJSON columns).
@@ -31,15 +33,65 @@ def get_engine(echo=False):
     # The DB role's default search_path doesn't include `public`, where the
     # PostGIS functions (ST_AsGeoJSON, ST_SimplifyPreserveTopology, ...) live.
     search_path = f"{get_schema()},public"
-    return create_engine(
+    engine = create_engine(
         url, echo=echo, connect_args={"options": f"-csearch_path={search_path}"}
     )
+    event.listen(engine, "before_cursor_execute", _record_sql)
+    return engine
 
 
 @lru_cache(maxsize=1)
 def get_schema():
     """Return the Postgres schema that holds the application tables."""
     return _require("DB_SCHEMA")
+
+
+# --- Debug SQL capture -------------------------------------------------------
+# While capture_sql() is active (one request with debug on), every statement
+# sent to Postgres is recorded with its parameters merged in by psycopg2's
+# mogrify -- i.e. exactly the SQL the server runs, ready to paste into a SQL
+# client. The log lives in a context variable, so concurrent requests don't
+# mix their statements.
+_sql_log = contextvars.ContextVar("sql_log", default=None)
+
+
+@contextmanager
+def capture_sql():
+    """Collect the SQL statements run inside this block into a list."""
+    log = []
+    token = _sql_log.set(log)
+    try:
+        yield log
+    finally:
+        _sql_log.reset(token)
+
+
+def log_sql(statement):
+    """Add a statement (or comment) to the active debug log, if any."""
+    log = _sql_log.get()
+    if log is not None:
+        log.append(statement)
+
+
+def _record_sql(conn, cursor, statement, parameters, context, executemany):
+    if _sql_log.get() is None:
+        return
+    # Skip SQLAlchemy/pandas metadata lookups; only the app's queries matter.
+    if "pg_catalog" in statement or "information_schema" in statement:
+        return
+    log_sql(cursor.mogrify(statement, parameters).decode().rstrip() + ";")
+
+
+def render_sql(sql, params):
+    """Return a `:name`-style statement with its parameters merged in, as
+    psycopg2 would send it, without running it."""
+    engine = get_engine()
+    compiled = str(text(sql).compile(dialect=engine.dialect))
+    raw = engine.raw_connection()
+    try:
+        return raw.cursor().mogrify(compiled, params).decode().rstrip() + ";"
+    finally:
+        raw.close()
 
 
 def query_df(sql, params=None):
@@ -99,8 +151,18 @@ def _scope_filter(state_id, county_id, alias):
     return f"{alias}.state_id = :state_id", {"state_id": state_id}
 
 
-@lru_cache(maxsize=32)
 def fetch_geometry_geojson(state_id, county_id=None):
+    """Return the area's geometry as a GeoJSON string (see _geometry())."""
+    hits = _geometry.cache_info().hits
+    fc, sql = _geometry(state_id, county_id)
+    if _geometry.cache_info().hits > hits:
+        # Nothing ran this time; show the query that built the cached copy.
+        log_sql(f"-- served from the server's geometry cache; built by:\n{sql}")
+    return fc
+
+
+@lru_cache(maxsize=32)
+def _geometry(state_id, county_id=None):
     """Return the geoobjects of a state (or of one county) as a GeoJSON
     FeatureCollection string. Each feature's id is its geoobject id, and its
     properties carry the labels shown on hover (name, county_name), which
@@ -110,7 +172,8 @@ def fetch_geometry_geojson(state_id, county_id=None):
     state/county and cached; indicator values are fetched separately by
     fetch_values() and joined to these features by id on the client.
     The JSON is built by Postgres and cached already serialized, so cache hits
-    skip both the database and Python-side JSON encoding.
+    skip both the database and Python-side JSON encoding. Returns
+    (geojson_text, sql_with_params).
     """
     schema = get_schema()
     where, params = _scope_filter(state_id, county_id, "g")
@@ -137,7 +200,9 @@ def fetch_geometry_geojson(state_id, county_id=None):
         f"where {where} and g.geom is not null"
     )
     with get_engine().connect() as conn:
-        return conn.execute(text(sql), params).scalar_one()
+        fc = conn.execute(text(sql), params).scalar_one()
+    # Kept with the cached result, so debug output can show it on cache hits.
+    return fc, render_sql(sql, params)
 
 
 def fetch_values(indicator_id, state_id, county_id=None):
@@ -195,6 +260,24 @@ _warming = set()
 _warm_lock = threading.Lock()
 
 
+def warm_sql(state_id, county_id=None):
+    """Return (sql, params) of the query warm_values() runs."""
+    schema = get_schema()
+    where, params = _scope_filter(state_id, county_id, "g")
+    sql = (
+        f"with objs as materialized ("
+        f"  select distinct g.id from {schema}.geoobject g "
+        f"  where {where} and g.county_id is not null order by g.id"
+        f") "
+        f"select count(v.value) from objs cross join lateral ("
+        f"  select v.value from {schema}.value v "
+        f"  where v.geoobject_id = objs.id and v.year < 2027"
+        f"  offset 0"
+        f") v"
+    )
+    return sql, params
+
+
 def warm_values(state_id, county_id=None):
     """Read every indicator's values for a state (or county) so the database
     pulls those pages into memory before the user asks for a map.
@@ -214,19 +297,7 @@ def warm_values(state_id, county_id=None):
             return
         _warming.add(key)
     try:
-        schema = get_schema()
-        where, params = _scope_filter(state_id, county_id, "g")
-        sql = (
-            f"with objs as materialized ("
-            f"  select distinct g.id from {schema}.geoobject g "
-            f"  where {where} and g.county_id is not null order by g.id"
-            f") "
-            f"select count(v.value) from objs cross join lateral ("
-            f"  select v.value from {schema}.value v "
-            f"  where v.geoobject_id = objs.id and v.year < 2027"
-            f"  offset 0"
-            f") v"
-        )
+        sql, params = warm_sql(state_id, county_id)
         with get_engine().connect() as conn:
             conn.execute(text(sql), params).scalar_one()
         with _warm_lock:

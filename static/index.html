@@ -10,11 +10,46 @@
   #app { display: flex; flex-direction: column; height: 100vh; }
   #filters {
     display: flex;
-    flex-direction: column;
-    gap: 12px;
+    flex-direction: row;
+    align-items: stretch;
+    gap: 24px;
     padding: 12px 16px;
     background: #f4f4f4;
     border-bottom: 1px solid #ddd;
+  }
+  #filterFields { display: flex; flex-direction: column; gap: 12px; }
+  .field.debug-toggle {
+    flex-direction: row;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    font-size: 13px;
+    font-weight: 600;
+    color: #333;
+    align-self: center;
+  }
+  #debugPanel { flex: 1; display: flex; flex-direction: column; gap: 4px; min-width: 300px; }
+  #debugPanel[hidden] { display: none; }
+  #debugPanel .debug-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    font-weight: 600;
+    color: #333;
+  }
+  #debugPanel .debug-header span { flex: 1; }
+  #debugPanel button { font-size: 12px; padding: 2px 10px; cursor: pointer; }
+  #debugSql {
+    flex: 1;
+    min-height: 90px;
+    resize: vertical;
+    font: 12px/1.4 Consolas, "Courier New", monospace;
+    white-space: pre;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    padding: 6px 8px;
+    background: #fff;
   }
   .filters-row {
     display: flex;
@@ -50,6 +85,7 @@
 <body>
 <div id="app">
   <div id="filters">
+   <div id="filterFields">
     <div class="filters-row">
       <div class="field">
         <label for="sep">Setor estratégico</label>
@@ -72,9 +108,21 @@
       <div class="field">
         <button id="loadMap" disabled>Exibir mapa</button>
       </div>
+      <label class="field debug-toggle">
+        <input type="checkbox" id="debug"> Debug
+      </label>
       <div class="field">
         <span id="loadStatus"></span>
       </div>
+    </div>
+   </div>
+    <div id="debugPanel" hidden>
+      <div class="debug-header">
+        <span>SQL executado (parâmetros já incluídos)</span>
+        <button type="button" id="debugCopy">Copiar</button>
+        <button type="button" id="debugClear">Limpar</button>
+      </div>
+      <textarea id="debugSql" readonly spellcheck="false"></textarea>
     </div>
   </div>
   <div id="map"></div>

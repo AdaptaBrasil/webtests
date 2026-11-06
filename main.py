@@ -1,12 +1,14 @@
 import hashlib
+import json
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-from fastapi import BackgroundTasks, FastAPI, Query
+from fastapi import BackgroundTasks, FastAPI, Query, Request
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -35,6 +37,22 @@ INDEX_HTML = _render_index()
 
 app = FastAPI(title="AdaptaBrasil - Mapa de Indicadores")
 app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+
+@app.middleware("http")
+async def debug_sql(request: Request, call_next):
+    """With request header `X-Debug-SQL: 1`, return the SQL the request ran
+    (parameters merged in) as a URL-encoded JSON list in the `X-Debug-SQL`
+    response header. The frontend's "Debug" checkbox shows it."""
+    if request.headers.get("x-debug-sql") != "1":
+        return await call_next(request)
+    with db.capture_sql() as log:
+        response = await call_next(request)
+    if log:
+        # Same search_path the app sets, so PostGIS functions resolve.
+        log.insert(0, f"SET search_path TO {db.get_schema()}, public;")
+        response.headers["X-Debug-SQL"] = quote(json.dumps(log))
+    return response
 
 
 @app.get("/")
@@ -76,7 +94,8 @@ def api_geometry(
     return Response(
         content=db.fetch_geometry_geojson(state_id, county_id),
         media_type="application/json",
-        headers={"Cache-Control": "public, max-age=86400"},
+        # Vary: a cached copy without debug SQL mustn't answer a debug request.
+        headers={"Cache-Control": "public, max-age=86400", "Vary": "X-Debug-SQL"},
     )
 
 
@@ -97,6 +116,11 @@ def api_warm(
 ):
     # Returns immediately; the read runs after the response is sent.
     background_tasks.add_task(db.warm_values, state_id, county_id)
+    db.log_sql(
+        "-- runs in the background after this response "
+        "(skipped if this area was warmed in the last 15 min):\n"
+        + db.render_sql(*db.warm_sql(state_id, county_id))
+    )
     return {"status": "warming"}
 
 
