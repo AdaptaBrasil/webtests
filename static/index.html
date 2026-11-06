@@ -107,28 +107,6 @@
   select:focus { outline: none; border-color: var(--green-500); box-shadow: var(--focus); }
   select:disabled { background-color: #f1f3f5; color: #9aa4ac; cursor: not-allowed; }
 
-  #loadMap {
-    font: inherit;
-    font-size: 14px;
-    font-weight: 600;
-    padding: 9px 22px;
-    border: none;
-    border-radius: 999px;
-    background: linear-gradient(135deg, var(--green-500), var(--green-700));
-    color: #fff;
-    cursor: pointer;
-    box-shadow: 0 3px 10px rgba(30, 111, 66, .35);
-    transition: transform .12s, box-shadow .12s, filter .12s;
-  }
-  #loadMap:hover:not(:disabled) {
-    transform: translateY(-1px);
-    box-shadow: 0 6px 16px rgba(30, 111, 66, .4);
-    filter: brightness(1.05);
-  }
-  #loadMap:active:not(:disabled) { transform: translateY(0); }
-  #loadMap:focus-visible { outline: none; box-shadow: var(--focus), 0 3px 10px rgba(30, 111, 66, .35); }
-  #loadMap:disabled { background: #c9d0d5; box-shadow: none; cursor: not-allowed; }
-
   /* Debug checkbox drawn as a toggle switch. */
   .field.debug-toggle {
     flex-direction: row;
@@ -376,9 +354,6 @@
       <div class="field">
         <label for="county">Município</label>
         <select id="county" disabled><option value="">(selecione)</option></select>
-      </div>
-      <div class="field">
-        <button id="loadMap" disabled>Exibir mapa</button>
       </div>
       <label class="field debug-toggle">
         <input type="checkbox" id="debug"> Debug

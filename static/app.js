@@ -2,7 +2,6 @@ const sepSelect = document.getElementById('sep');
 const indicatorSelect = document.getElementById('indicator');
 const stateSelect = document.getElementById('state');
 const countySelect = document.getElementById('county');
-const loadButton = document.getElementById('loadMap');
 const loadStatus = document.getElementById('loadStatus');
 const legendBox = document.getElementById('legend');
 const legendTitle = document.getElementById('legendTitle');
@@ -89,10 +88,6 @@ function fillSelect(select, items, valueKey, labelKey, placeholder) {
   }
 }
 
-function updateLoadButtonState() {
-  loadButton.disabled = !(indicatorSelect.value && stateSelect.value);
-}
-
 async function loadSeps() {
   const data = await fetchJson('/api/seps');
   fillSelect(sepSelect, data, 'id', 'name', '(selecione)');
@@ -104,6 +99,8 @@ async function loadIndicators(sepId) {
   if (!sepId) return;
 
   const data = await fetchJson(`/api/indicators?sep_id=${encodeURIComponent(sepId)}`);
+  // The user may have picked another sector while this was loading.
+  if (sepSelect.value !== sepId) return;
   fillSelect(indicatorSelect, data, 'id', 'name', '(selecione)');
   indicatorSelect.disabled = false;
 }
@@ -122,19 +119,21 @@ async function loadStates() {
 }
 
 async function loadCounties(stateId) {
-  if (!stateId || stateId === BRASIL) {
-    countySelect.innerHTML = '<option value="">(selecione)</option>';
-    countySelect.disabled = true;
-    return;
-  }
+  // Cleared right away, not after the fetch: the map loads as soon as the
+  // state changes and must not see the previous state's municipality.
+  countySelect.innerHTML = '<option value="">(selecione)</option>';
+  countySelect.disabled = true;
+  if (!stateId || stateId === BRASIL) return;
   const data = await fetchJson(`/api/counties?state_id=${encodeURIComponent(stateId)}`);
+  // The user may have picked another state while this was loading.
+  if (stateSelect.value !== stateId) return;
   fillSelect(countySelect, data, 'id', 'name', '(selecione)');
   countySelect.disabled = false;
 }
 
 sepSelect.addEventListener('change', () => {
   loadIndicators(sepSelect.value);
-  updateLoadButtonState();
+  scheduleMapLoad();
 });
 
 // --- Map -----------------------------------------------------------------------
@@ -186,15 +185,16 @@ function warmArea() {
   getBounds(params).catch(() => {});
 }
 
+// The map follows the selects: every change reloads it (see scheduleMapLoad()).
 stateSelect.addEventListener('change', () => {
   loadCounties(stateSelect.value);
-  updateLoadButtonState();
   warmArea();
+  scheduleMapLoad();
 });
-indicatorSelect.addEventListener('change', updateLoadButtonState);
+indicatorSelect.addEventListener('change', scheduleMapLoad);
 countySelect.addEventListener('change', () => {
-  updateLoadButtonState();
   warmArea();
+  scheduleMapLoad();
 });
 
 // Legend ranges in Brazilian format, as AdaptaBrasil shows them: "0,00 a 0,19".
@@ -318,6 +318,25 @@ function ensureMap() {
           'fill-antialias': false
         }
       });
+      // Census tract outlines from zoom 11, where tracts are real shapes
+      // (below ~z10 many are drawn as 2px squares, which outlines would turn
+      // into noise). Only tracts with a color get one, so tracts outside the
+      // selected state/municipality stay invisible.
+      map.addLayer({
+        id: 'tract-lines',
+        type: 'line',
+        source: 'tracts',
+        'source-layer': 'tracts',
+        minzoom: 11,
+        paint: {
+          'line-color': '#ffffff',
+          // ['zoom'] must be the top-level interpolate input.
+          'line-opacity': ['interpolate', ['linear'], ['zoom'],
+            11, ['case', hasColor, 0.3, 0],
+            14, ['case', hasColor, 0.55, 0]],
+          'line-width': ['interpolate', ['linear'], ['zoom'], 11, 0.3, 14, 0.8, 16, 1.2]
+        }
+      });
       // Municipality lines from zoom 6 (the tiles only carry them from there),
       // thin and translucent; state lines at every zoom, darker and wider.
       map.addLayer({
@@ -344,7 +363,7 @@ function ensureMap() {
           'line-width': ['interpolate', ['linear'], ['zoom'], 2, 0.6, 6, 1.4, 10, 2.4]
         }
       });
-      // No lines between tracts: only the one under the mouse gets an outline.
+      // The tract under the mouse gets a dark outline.
       map.addLayer({
         id: 'tracts-hover',
         type: 'line',
@@ -420,7 +439,6 @@ function paintTracts(readyMap, states) {
 let currentAreaKey = null;
 
 function startLoading() {
-  loadButton.disabled = true;
   loadStatus.textContent = 'Carregando mapa...';
   loadStatus.dataset.state = 'loading';
   return performance.now();
@@ -454,16 +472,17 @@ function getBrasilIds() {
   return brasilIdsRequest;
 }
 
-async function loadBrasilMap(startTime) {
+async function loadBrasilMap(load) {
   const indicatorId = indicatorSelect.value;
   const classesUrl = `/api/brasil/classes?indicator_id=${encodeURIComponent(indicatorId)}`;
   const legendUrl = `/api/legend?indicator_id=${encodeURIComponent(indicatorId)}`;
   const [ids, classes, legend, readyMap] = await Promise.all([
     getBrasilIds(),
-    apiFetch(classesUrl),
-    apiFetch(legendUrl),
+    apiFetch(classesUrl, { signal: load.signal }),
+    apiFetch(legendUrl, { signal: load.signal }),
     ensureMap()
   ]);
+  if (!load.isCurrent()) return;
   if (classes.data.version !== ids.version) {
     // The server's tract list changed since the ids were loaded.
     brasilIdsRequest = null;
@@ -486,23 +505,24 @@ async function loadBrasilMap(startTime) {
   renderLegend(indicatorSelect.selectedOptions[0].textContent, legend.data);
   if (currentAreaKey !== 'BR') readyMap.fitBounds(BRAZIL_BOUNDS, { padding: 20, duration: 500 });
   currentAreaKey = 'BR';
-  finishLoading(startTime, `${states.length.toLocaleString('pt-BR')} setores (Brasil)`);
+  finishLoading(load.startTime, `${states.length.toLocaleString('pt-BR')} setores (Brasil)`);
 }
 
 // --- State / municipality ----------------------------------------------------------
 
-async function loadAreaMap(startTime) {
+async function loadAreaMap(load) {
   const scope = areaParams();
   const valueParams = new URLSearchParams(scope);
   valueParams.set('indicator_id', indicatorSelect.value);
   const valuesUrl = `/api/values?${valueParams.toString()}`;
   const legendUrl = `/api/legend?indicator_id=${encodeURIComponent(indicatorSelect.value)}`;
   const [bounds, values, legend, readyMap] = await Promise.all([
-    getBounds(scope),
-    apiFetch(valuesUrl),
-    apiFetch(legendUrl),
+    getBounds(scope), // shared prefetch: not aborted
+    apiFetch(valuesUrl, { signal: load.signal }),
+    apiFetch(legendUrl, { signal: load.signal }),
     ensureMap()
   ]);
+  if (!load.isCurrent()) return;
   if (debugCheckbox.checked) {
     appendDebugSql(`GET ${bounds.url}`, bounds.sql || ['-- (carregados com o Debug desligado)']);
     appendDebugSql(`GET ${valuesUrl}`, values.sql);
@@ -517,23 +537,65 @@ async function loadAreaMap(startTime) {
     readyMap.fitBounds(bounds.data, { padding: 40, duration: 500 });
   }
   currentAreaKey = areaKey;
-  finishLoading(startTime, `${rows.length.toLocaleString('pt-BR')} setores`);
+  finishLoading(load.startTime, `${rows.length.toLocaleString('pt-BR')} setores`);
+}
+
+// --- Automatic loading ---------------------------------------------------------------
+// There's no "show map" button: once sector, indicator and state are chosen,
+// any change to the selects reloads the map. Loads can overlap (e.g. the user
+// picks MG, then BH, while MG is still loading), so each load gets a sequence
+// number: a newer load aborts the older one's requests, and an older load that
+// still finishes is discarded instead of painting over the newer map.
+
+const LOAD_DELAY_MS = 300; // arrow keys in a select fire one change per step
+let loadTimer = null;
+let loadSeq = 0;
+let loadController = null;
+
+function showHint(text) {
+  loadStatus.textContent = text;
+  delete loadStatus.dataset.state;
+}
+
+function missingSelection() {
+  if (!sepSelect.value) return 'Selecione o setor estratégico';
+  if (!indicatorSelect.value) return 'Selecione um indicador';
+  if (!stateSelect.value) return 'Selecione um estado';
+  return null;
+}
+
+function scheduleMapLoad() {
+  clearTimeout(loadTimer);
+  const missing = missingSelection();
+  if (missing) {
+    // Cancel any load in flight; the map keeps showing the last indicator.
+    loadSeq++;
+    if (loadController) loadController.abort();
+    showHint(missing);
+    return;
+  }
+  loadTimer = setTimeout(loadMapData, LOAD_DELAY_MS);
 }
 
 async function loadMapData() {
-  const startTime = startLoading();
+  const seq = ++loadSeq;
+  if (loadController) loadController.abort();
+  loadController = new AbortController();
+  const load = {
+    signal: loadController.signal,
+    isCurrent: () => seq === loadSeq,
+    startTime: startLoading()
+  };
   try {
-    await (isBrasil() ? loadBrasilMap(startTime) : loadAreaMap(startTime));
+    await (isBrasil() ? loadBrasilMap(load) : loadAreaMap(load));
   } catch (err) {
+    if (!load.isCurrent()) return; // superseded: its errors (aborts) don't matter
     loadStatus.textContent = 'Erro ao carregar o mapa';
     loadStatus.dataset.state = 'error';
     throw err;
-  } finally {
-    loadButton.disabled = false;
   }
 }
 
-loadButton.addEventListener('click', loadMapData);
-
 loadSeps();
 loadStates();
+showHint(missingSelection());
