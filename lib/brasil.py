@@ -25,6 +25,7 @@ The caches are tables in the database (shared by every app instance that
 uses it); rebuild them after the geometry or the values change.
 """
 import hashlib
+import json
 import math
 import threading
 from collections import OrderedDict
@@ -43,6 +44,19 @@ TRACT_SEP_ID = 10  # strategic sector whose indicators have tract values
 CLASSES_TABLE = "webtests_tract_classes"
 TILES_TABLE = "webtests_tiles"
 BOUNDARY_TILES_TABLE = "webtests_boundary_tiles"
+
+# Country map below COUNTY_FILL_MAX_ZOOM: municipalities instead of tracts,
+# colored by the mean of their tracts' values (one weight per tract: census
+# tracts are drawn with similar household counts, so this is close to a
+# population-weighted mean; an area-weighted one lets near-empty rural
+# tracts dominate and hides cities -- Sao Paulo's density 0.29 vs 0.72).
+# At those zooms
+# most tracts are smaller than a pixel and are drawn as 2px squares colored
+# by the biggest tract of each cell, which hides cities (dense, tiny tracts)
+# and speckles the map wherever a big tract has no data.
+COUNTY_CLASSES_TABLE = "webtests_county_classes"
+COUNTY_TILES_TABLE = "webtests_county_tiles"
+COUNTY_FILL_MAX_ZOOM = 8
 
 # Boundary lines (their own tiles, drawn over the tract colors).
 STATE_TYPE_ID = 4
@@ -84,6 +98,15 @@ def ensure_tables():
             f"  indicator_id integer primary key,"
             f"  ids_version text not null,"
             f"  classes text not null,"
+            f"  built_at timestamptz not null default now())"
+        ))
+        # Municipality ids, classes and means of one indicator,
+        # as the JSON the client gets (see county_payload()).
+        conn.execute(text(
+            f"create table if not exists {schema}.{COUNTY_CLASSES_TABLE} ("
+            f"  indicator_id integer primary key,"
+            f"  ids_version text not null,"
+            f"  payload text not null,"
             f"  built_at timestamptz not null default now())"
         ))
         for table in TILE_TABLES.values():
@@ -156,85 +179,178 @@ def classify(values, legend):
     return out
 
 
-def class_string(geoobject_ids, years, values, legend):
-    """Class string aligned to tract_ids() (see the module doc)."""
+def tract_values(geoobject_ids, years, values):
+    """One indicator's rows of `value` aligned to tract_ids(): (values,
+    has_row). One value per tract -- the latest year (< 2027) wins, as on a
+    state map; NaN where the value is null or the tract has no row."""
     ids, _ = _tract_ids()
     geoobject_ids = np.asarray(geoobject_ids, dtype=np.int64)
     years = np.asarray(years, dtype=np.int64)
     values = np.array([np.nan if v is None else v for v in values], dtype=float)
-    # One value per tract: the latest year (< 2027) wins, as on a state map.
     order = np.lexsort((years, geoobject_ids))
     geoobject_ids, values = geoobject_ids[order], values[order]
     last = np.append(geoobject_ids[1:] != geoobject_ids[:-1], True)
     geoobject_ids, values = geoobject_ids[last], values[last]
 
-    cls = classify(values, legend)
     pos = np.clip(np.searchsorted(ids, geoobject_ids), 0, len(ids) - 1)
-    keep = (ids[pos] == geoobject_ids) & (cls >= 0)
-    chars = np.full(len(ids), ord("-"), dtype=np.uint8)
-    chars[pos[keep]] = ord("0") + cls[keep]
+    keep = ids[pos] == geoobject_ids
+    aligned = np.full(len(ids), np.nan)
+    has_row = np.zeros(len(ids), dtype=bool)
+    aligned[pos[keep]] = values[keep]
+    has_row[pos[keep]] = True
+    return aligned, has_row
+
+
+def _class_chars(values, present, legend):
+    """Class string: legend index per value, "-" where not present (or the
+    value falls outside the legend)."""
+    cls = classify(values, legend)
+    ok = present & (cls >= 0)
+    chars = np.full(len(values), ord("-"), dtype=np.uint8)
+    chars[ok] = ord("0") + cls[ok]
     return chars.tobytes().decode("ascii")
 
 
-def store_classes(conn, indicator_id, version, classes):
-    conn.execute(
-        text(
-            f"insert into {db.get_schema()}.{CLASSES_TABLE} (indicator_id, ids_version, classes) "
-            f"values (:indicator_id, :version, :classes) "
-            f"on conflict (indicator_id) do update set ids_version = excluded.ids_version, "
-            f"  classes = excluded.classes, built_at = now()"
-        ),
-        {"indicator_id": indicator_id, "version": version, "classes": classes},
-    )
+def class_string(values, has_row, legend):
+    """Class string aligned to tract_ids() (see the module doc), from
+    tract_values()."""
+    return _class_chars(values, has_row, legend)
+
+
+# --- municipalities (country map at low zoom) ----------------------------------
+
+def _tract_counties_sql():
+    # Same tracts, same order as _tract_ids_sql(), answered from the same
+    # index (county_id, id).
+    return (f"select id, county_id from {db.get_schema()}.geoobject "
+            f"where county_id is not null and county_id <> id order by id")
+
+
+@lru_cache(maxsize=1)
+def _tract_counties():
+    """(county ids, county index of each tract), aligned to tract_ids()."""
+    df = db.query_df(_tract_counties_sql())
+    ids, _ = _tract_ids()
+    if not np.array_equal(df["id"].to_numpy(dtype=np.int64), ids):
+        raise RuntimeError("tract list changed while building the municipality index; retry")
+    county_ids, county_index = np.unique(df["county_id"].to_numpy(dtype=np.int64), return_inverse=True)
+    return county_ids, county_index
+
+
+def county_payload(values, has_row, legend):
+    """Per municipality (that has tracts): the mean of its tracts' values
+    (one weight per tract; tracts with a null value left out) and that mean's
+    legend class. A municipality whose tracts all have null values gets the
+    "no data" item; one whose tracts have no rows at all gets "-". JSON text:
+    {"ids": [...], "classes": "...", "values": [...]} (classes/values
+    aligned to ids)."""
+    county_ids, idx = _tract_counties()
+    n = len(county_ids)
+    ok = has_row & ~np.isnan(values)
+    weighted = np.bincount(idx[ok], weights=values[ok], minlength=n)
+    total = np.bincount(idx[ok], minlength=n)
+    present = np.bincount(idx[has_row], minlength=n) > 0
+    mean = np.full(n, np.nan)
+    np.divide(weighted, total, out=mean, where=total > 0)
+    return json.dumps({
+        "ids": county_ids.tolist(),
+        "classes": _class_chars(mean, present, legend),
+        "values": [None if np.isnan(v) else round(float(v), 4) for v in mean],
+    }, separators=(",", ":"))
+
+
+def indicator_caches(geoobject_ids, years, values, legend):
+    """(tract class string, municipality payload) of one indicator, from its
+    rows of `value`."""
+    aligned, has_row = tract_values(geoobject_ids, years, values)
+    return class_string(aligned, has_row, legend), county_payload(aligned, has_row, legend)
+
+
+def empty_caches(legend):
+    """Caches of an indicator without tract values."""
+    n = len(_tract_ids()[0])
+    return "-" * n, county_payload(np.full(n, np.nan), np.zeros(n, dtype=bool), legend)
+
+
+def store_classes(conn, indicator_id, version, classes, county):
+    """Upsert one indicator's tract class string and municipality payload."""
+    schema = db.get_schema()
+    for table, column, data in ((CLASSES_TABLE, "classes", classes),
+                                (COUNTY_CLASSES_TABLE, "payload", county)):
+        conn.execute(
+            text(
+                f"insert into {schema}.{table} (indicator_id, ids_version, {column}) "
+                f"values (:indicator_id, :version, :data) "
+                f"on conflict (indicator_id) do update set ids_version = excluded.ids_version, "
+                f"  {column} = excluded.{column}, built_at = now()"
+            ),
+            {"indicator_id": indicator_id, "version": version, "data": data},
+        )
 
 
 def build_classes(indicator_id):
-    """Compute one indicator's class string from `value` and store it.
-    Slow when cold (~200 s, see the module doc); precompute.py builds them
-    all in one pass instead."""
+    """Compute one indicator's class string and municipality payload from
+    `value` and store them. Slow when cold (~200 s, see the module doc);
+    precompute.py builds them all in one pass instead."""
     _, version = _tract_ids()
     df = db.query_df(
         f"select geoobject_id, year, value from {db.get_schema()}.value "
         f"where indicator_id = :indicator_id and year < 2027",
         {"indicator_id": indicator_id},
     )
-    classes = class_string(df["geoobject_id"], df["year"], df["value"], db.fetch_legend(indicator_id))
+    classes, county = indicator_caches(
+        df["geoobject_id"], df["year"], df["value"], db.fetch_legend(indicator_id))
     with db.get_engine().begin() as conn:
-        store_classes(conn, indicator_id, version, classes)
-    return classes
+        store_classes(conn, indicator_id, version, classes, county)
+    return {"tracts": classes, "counties": county}
 
 
-# (indicator_id, ids version) -> class string, most recent last.
+# Per-indicator caches: kind -> (table, column). Both are built together.
+_CACHES = {"tracts": (CLASSES_TABLE, "classes"), "counties": (COUNTY_CLASSES_TABLE, "payload")}
+# (kind, indicator_id, ids version) -> cached text, most recent last.
 _classes_mem = OrderedDict()
 _classes_lock = threading.Lock()
-MAX_CLASSES_IN_MEMORY = 64
+MAX_CLASSES_IN_MEMORY = 128
+
+
+def _fetch_cached(kind, indicator_id):
+    """One indicator's cached text of the given kind: from memory, else from
+    its table, else built from `value` (slow) and stored."""
+    ensure_tables()
+    _, version = tract_ids()
+    key = (kind, indicator_id, version)
+    with _classes_lock:
+        data = _classes_mem.get(key)
+    if data is not None:
+        db.log_sql(f"-- {kind} classes served from the server's memory")
+        return data, version
+    table, column = _CACHES[kind]
+    sql = (
+        f"select {column} from {db.get_schema()}.{table} "
+        f"where indicator_id = :indicator_id and ids_version = :version"
+    )
+    with db.get_engine().connect() as conn:
+        data = conn.execute(text(sql), {"indicator_id": indicator_id, "version": version}).scalar()
+    if data is None:
+        db.log_sql("-- not precomputed yet: built now from the values (slow when cold):")
+        data = build_classes(indicator_id)[kind]
+    with _classes_lock:
+        _classes_mem[key] = data
+        while len(_classes_mem) > MAX_CLASSES_IN_MEMORY:
+            _classes_mem.popitem(last=False)
+    return data, version
 
 
 def fetch_classes(indicator_id):
-    """Return {version, classes} for the indicator: from memory, else from
-    CLASSES_TABLE, else built from `value` (slow) and stored."""
-    ensure_tables()
-    _, version = tract_ids()
-    key = (indicator_id, version)
-    with _classes_lock:
-        classes = _classes_mem.get(key)
-    if classes is not None:
-        db.log_sql("-- class string served from the server's memory")
-    else:
-        sql = (
-            f"select classes from {db.get_schema()}.{CLASSES_TABLE} "
-            f"where indicator_id = :indicator_id and ids_version = :version"
-        )
-        with db.get_engine().connect() as conn:
-            classes = conn.execute(text(sql), {"indicator_id": indicator_id, "version": version}).scalar()
-        if classes is None:
-            db.log_sql("-- not precomputed yet: built now from the values (slow when cold):")
-            classes = build_classes(indicator_id)
-        with _classes_lock:
-            _classes_mem[key] = classes
-            while len(_classes_mem) > MAX_CLASSES_IN_MEMORY:
-                _classes_mem.popitem(last=False)
+    """Return {version, classes} for the indicator (tract class string)."""
+    classes, version = _fetch_cached("tracts", indicator_id)
     return {"version": version, "classes": classes}
+
+
+def fetch_county_payload(indicator_id):
+    """The indicator's municipality payload, as JSON text (see
+    county_payload())."""
+    return _fetch_cached("counties", indicator_id)[0]
 
 
 # --- vector tiles --------------------------------------------------------------
@@ -325,9 +441,47 @@ def boundary_tile_sql(z, x, y):
     return sql, params
 
 
+def county_tile_sql(z, x, y):
+    """(sql, params) building one MVT tile (layer "counties") of municipality
+    polygons, for the country map below COUNTY_FILL_MAX_ZOOM. Feature ids
+    are the municipalities' geoobject ids (the tracts' county_id)."""
+    schema = db.get_schema()
+    px_deg = 360.0 / (2 ** z) / SCREEN_PX_PER_TILE
+    sql = (
+        f"with env as ("
+        f"  select ST_TileEnvelope(:z, :x, :y) as e3857,"
+        f"         ST_Transform(ST_TileEnvelope(:z, :x, :y, margin => :margin), 4326) as e4326"
+        f") "
+        f"select ST_AsMVT(t, 'counties', :extent, 'geom', 'id') from ("
+        f"  select g.id,"
+        f"         ST_AsMVTGeom(ST_Transform(ST_Simplify(g.geom, :tolerance, true), 3857),"
+        f"                      env.e3857, :extent, :buffer, true) as geom"
+        f"  from {schema}.geoobject g, env"
+        f"  where g.geoobjecttype_id = {COUNTY_TYPE_ID} and g.geom && env.e4326"
+        f") t where geom is not null"
+    )
+    params = {
+        "z": z, "x": x, "y": y,
+        "margin": TILE_BUFFER / TILE_EXTENT,
+        "extent": TILE_EXTENT, "buffer": TILE_BUFFER,
+        # One tile grid unit (1/8 px), not half a pixel as for tracts: each
+        # municipality is simplified on its own, and a coarser tolerance
+        # opens gaps between neighbours that speckle the country map.
+        "tolerance": px_deg * SCREEN_PX_PER_TILE / TILE_EXTENT,
+    }
+    return sql, params
+
+
 # Tile sets: name -> (query builder, cache table).
-TILE_SQL = {"tracts": tile_sql, "boundaries": boundary_tile_sql}
-TILE_TABLES = {"tracts": TILES_TABLE, "boundaries": BOUNDARY_TILES_TABLE}
+TILE_SQL = {"tracts": tile_sql, "boundaries": boundary_tile_sql, "counties": county_tile_sql}
+TILE_TABLES = {"tracts": TILES_TABLE, "boundaries": BOUNDARY_TILES_TABLE,
+               "counties": COUNTY_TILES_TABLE}
+# Version of each set, added to its tile URLs (?v=): browsers keep tiles for
+# a day (Cache-Control), so bump it after rebuilding a set (truncating its
+# table) or they keep showing the old tiles.
+TILE_VERSIONS = {"tracts": 1, "boundaries": 1, "counties": 2}
+# Highest zoom each set is built for (the map overzooms beyond it).
+TILE_MAX_ZOOM = {"tracts": MAX_ZOOM, "boundaries": MAX_ZOOM, "counties": COUNTY_FILL_MAX_ZOOM - 1}
 
 
 def build_tile(z, x, y, kind="tracts"):
@@ -368,7 +522,13 @@ def brazil_tiles(z):
 
 def tiles_config():
     """What the client needs to set up the tile source."""
-    return {"bounds": BRAZIL_BOUNDS, "minzoom": MIN_ZOOM, "maxzoom": MAX_ZOOM}
+    return {
+        "bounds": BRAZIL_BOUNDS, "minzoom": MIN_ZOOM, "maxzoom": MAX_ZOOM,
+        # Country map: municipalities (their own tiles, up to this zoom - 1)
+        # below this zoom, tracts from it on.
+        "county_fill_maxzoom": COUNTY_FILL_MAX_ZOOM,
+        "versions": TILE_VERSIONS,
+    }
 
 
 def tile_debug_sql():

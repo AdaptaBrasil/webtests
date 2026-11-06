@@ -150,8 +150,15 @@ def api_brasil_classes(indicator_id: int = Query(...)):
     return result
 
 
+@app.get("/api/brasil/counties")
+def api_brasil_counties(indicator_id: int = Query(...)):
+    """Municipality ids, classes and area-weighted means of the indicator
+    (country map below brasil.COUNTY_FILL_MAX_ZOOM). Stored as JSON text."""
+    return Response(content=brasil.fetch_county_payload(indicator_id), media_type="application/json")
+
+
 def _tile_response(z, x, y, kind):
-    if not (brasil.MIN_ZOOM <= z <= brasil.MAX_ZOOM and 0 <= x < 2 ** z and 0 <= y < 2 ** z):
+    if not (brasil.MIN_ZOOM <= z <= brasil.TILE_MAX_ZOOM[kind] and 0 <= x < 2 ** z and 0 <= y < 2 ** z):
         return Response(status_code=404)
     return Response(
         content=brasil.fetch_tile(z, x, y, kind),
@@ -172,10 +179,17 @@ def api_boundary_tile(z: int, x: int, y: int):
     return _tile_response(z, x, y, "boundaries")
 
 
+@app.get("/api/municipalities/{z}/{x}/{y}.pbf")
+def api_county_tile(z: int, x: int, y: int):
+    """Municipality polygons (layer "counties"), for the country map at low zoom."""
+    return _tile_response(z, x, y, "counties")
+
+
 @app.get("/api/geoobject/{geoobject_id}")
-def api_geoobject(geoobject_id: int):
-    """Name and municipality of one geoobject (hover popup on the country map)."""
-    return db.fetch_geoobject_label(geoobject_id)
+def api_geoobject(geoobject_id: int, indicator_id: Optional[int] = Query(None)):
+    """Name and municipality of one geoobject (hover popup); with
+    indicator_id, also its value (the country map has only the class)."""
+    return db.fetch_geoobject_label(geoobject_id, indicator_id)
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

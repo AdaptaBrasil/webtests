@@ -1,14 +1,16 @@
 """Precompute the whole-country (Brasil) map caches (see lib/brasil.py).
 
-    python -m lib.precompute              # class strings, tract tiles, boundary tiles
-    python -m lib.precompute classes      # only the class strings
+    python -m lib.precompute              # classes, tract/boundary/municipality tiles
+    python -m lib.precompute classes      # tract class strings + municipality classes
     python -m lib.precompute tiles [MAX_ZOOM]
     python -m lib.precompute boundaries [MAX_ZOOM]
+    python -m lib.precompute counties     # municipality polygon tiles
 
 In Docker: docker compose exec app python -m lib.precompute
 
 Class strings: one sequential read of `value` (~3-5 min) builds every
-indicator of the tract sector at once. Tiles: builds the zoom levels used to
+indicator of the tract sector at once, plus each indicator's municipality
+classes (mean of its tracts' values). Tiles: builds the zoom levels used to
 view the country (MIN_ZOOM..PRECOMPUTE_MAX_ZOOM, ~1500 tiles at z9 alone),
 skipping tiles already stored; safe to stop and rerun. Higher zooms cover
 small areas and are built on demand.
@@ -61,24 +63,23 @@ def precompute_classes():
         )
         results = []
         for indicator_id, ids, years, values in rows:
-            classes = brasil.class_string(ids, years, values, legends[indicator_id])
-            results.append((indicator_id, classes))
+            classes, county = brasil.indicator_caches(ids, years, values, legends[indicator_id])
+            results.append((indicator_id, classes, county))
             done.add(indicator_id)
             print(f"  {indicator_id}: {len(ids)} values  ({time.time() - t0:.0f}s)", flush=True)
     # Indicators without tract values: store all "-" so the map doesn't
     # rescan `value` looking for them.
-    empty = "-" * len(brasil._tract_ids()[0])
-    results += [(i, empty) for i in indicators if i not in done]
+    results += [(i, *brasil.empty_caches(legends[i])) for i in indicators if i not in done]
     with db.get_engine().begin() as conn:
-        for indicator_id, classes in results:
-            brasil.store_classes(conn, indicator_id, version, classes)
+        for indicator_id, classes, county in results:
+            brasil.store_classes(conn, indicator_id, version, classes, county)
     print(f"stored {len(results)} class strings in {time.time() - t0:.0f}s", flush=True)
 
 
 def precompute_tiles(max_zoom=brasil.PRECOMPUTE_MAX_ZOOM, kind="tracts"):
     brasil.ensure_tables()
     schema = db.get_schema()
-    for z in range(brasil.MIN_ZOOM, max_zoom + 1):
+    for z in range(brasil.MIN_ZOOM, min(max_zoom, brasil.TILE_MAX_ZOOM[kind]) + 1):
         have = set(
             map(tuple, db.query_df(
                 f"select x, y from {schema}.{brasil.TILE_TABLES[kind]} where z = :z", {"z": z}
@@ -105,3 +106,5 @@ if __name__ == "__main__":
         precompute_tiles(max_zoom, "tracts")
     if what in ("all", "boundaries"):
         precompute_tiles(max_zoom, "boundaries")
+    if what in ("all", "counties"):
+        precompute_tiles(max_zoom, "counties")

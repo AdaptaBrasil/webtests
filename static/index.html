@@ -234,6 +234,33 @@
     box-shadow: var(--shadow) !important;
   }
 
+  /* Zoom readout (and, on the Brasil map, the municipality/tract switch
+     level): small frosted card, top-left over the map. */
+  #zoomBox {
+    position: absolute;
+    left: 16px;
+    top: 14px;
+    z-index: 2;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 8px 12px;
+    font-size: 12.5px;
+    color: var(--ink, #1f2a30);
+    background: rgba(255, 255, 255, .82);
+    backdrop-filter: blur(10px) saturate(1.4);
+    -webkit-backdrop-filter: blur(10px) saturate(1.4);
+    border: 1px solid rgba(255, 255, 255, .7);
+    border-radius: 12px;
+    box-shadow: var(--shadow);
+  }
+  #zoomBox .zoom-label { color: var(--muted); text-transform: uppercase; font-size: 11px; letter-spacing: .04em; }
+  #zoomLevel { font-variant-numeric: tabular-nums; }
+  #zoomShowing { color: var(--muted); }
+  #switchField { display: flex; align-items: center; gap: 6px; color: var(--muted); }
+  #switchField[hidden] { display: none; }
+  #switchZoom { padding: 2px 22px 2px 8px; font-size: 12.5px; width: auto; }
+
   /* Color legend: frosted card, bottom-left over the map. */
   #legend {
     position: absolute;
@@ -374,6 +401,13 @@
   </div>
   <div id="mapWrap">
     <div id="map"></div>
+    <div id="zoomBox">
+      <div><span class="zoom-label">Zoom</span> <b id="zoomLevel">–</b> <span id="zoomShowing"></span></div>
+      <label id="switchField" hidden>
+        Municípios até o zoom
+        <select id="switchZoom"></select>
+      </label>
+    </div>
     <div id="legend" hidden>
       <div class="legend-title" id="legendTitle"></div>
       <div class="legend-subtitle">Presente</div>

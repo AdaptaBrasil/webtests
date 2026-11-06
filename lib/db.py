@@ -245,19 +245,34 @@ def fetch_values(indicator_id, state_id, county_id=None):
     return df.astype(object).where(df.notna(), None).to_dict(orient="records")
 
 
-def fetch_geoobject_label(geoobject_id):
+def fetch_geoobject_label(geoobject_id, indicator_id=None):
     """Name and municipality name of one geoobject, as on the state map's
-    hover popup."""
+    hover popup. With indicator_id, also its value for that indicator (same
+    rows as fetch_values(): year < 2027, latest year first), for the country
+    map, which only has the legend class. One probe of
+    value_geoobject_covering_idx (geoobject_id, indicator_id, year): ~ms."""
     schema = get_schema()
+    params = {"id": geoobject_id}
+    value_col = ""
+    if indicator_id is not None:
+        params["indicator_id"] = indicator_id
+        value_col = (
+            f", (select v.value from {schema}.value v "
+            f"   where v.geoobject_id = g.id and v.indicator_id = :indicator_id and v.year < 2027 "
+            f"   order by v.year desc limit 1) as value"
+        )
     df = query_df(
         f"select case when g.state is null then g.name::text "
         f"            else concat(g.name, '/', g.state) end as name, "
-        f"       c.name::text as county_name "
+        f"       c.name::text as county_name{value_col} "
         f"from {schema}.geoobject g left join {schema}.geoobject c on c.id = g.county_id "
         f"where g.id = :id",
-        {"id": geoobject_id},
+        params,
     )
-    return df.to_dict(orient="records")[0] if len(df) else {"name": None, "county_name": None}
+    if not len(df):
+        return {"name": None, "county_name": None}
+    # NaN isn't valid JSON; send a missing value as null.
+    return df.astype(object).where(df.notna(), None).to_dict(orient="records")[0]
 
 
 # Areas warmed recently (key -> monotonic time) and areas being warmed now,

@@ -148,6 +148,10 @@ sepSelect.addEventListener('change', () => {
 //     loadBrasilMap()).
 
 const TRACTS = { source: 'tracts', sourceLayer: 'tracts' };
+const COUNTIES = { source: 'counties', sourceLayer: 'counties' };
+// Country map: municipalities below this zoom, tracts from it on (set from
+// /api/tiles/config).
+let countyFillMaxZoom = 8;
 const BRAZIL_BOUNDS = [[-74.0, -33.8], [-34.7, 5.3]];
 
 function areaParams() {
@@ -232,25 +236,38 @@ function renderLegend(title, items) {
   legendBox.hidden = items.length === 0;
 }
 
-// geoobject id -> {name, county_name} (or the pending request), for hover:
-// tiles carry no names.
+// Hover popup data, as {name, county_name[, value]} or the pending request:
+// tiles carry no names. State/municipality maps already have each tract's
+// value (feature-state), so they ask for the name only, keyed by id. The
+// country map has only the legend class, so it also asks for the exact value
+// of the painted indicator, keyed by "id|indicator".
 const geoobjectLabels = new Map();
+// Indicator painted on the Brasil map (set by loadBrasilMap()).
+let brasilIndicatorId = null;
 
-function getGeoobjectLabel(id) {
-  if (!geoobjectLabels.has(id)) {
-    const request = fetch(`/api/geoobject/${id}`).then((r) => r.json());
-    geoobjectLabels.set(id, request);
-    request.then((label) => geoobjectLabels.set(id, label), () => geoobjectLabels.delete(id));
-  }
-  return Promise.resolve(geoobjectLabels.get(id));
+function labelKey(id, indicatorId) {
+  return indicatorId ? `${id}|${indicatorId}` : `${id}`;
 }
 
-// Popup value text: the exact value (state/municipality), or the legend
-// item (Brasil, where only the class is precomputed).
-function tipText(state) {
-  if ('value' in state) {
-    return state.value == null ? 'Dado indisponível' : Number(state.value).toFixed(4);
+function getGeoobjectLabel(id, indicatorId) {
+  const key = labelKey(id, indicatorId);
+  if (!geoobjectLabels.has(key)) {
+    const query = indicatorId ? `?indicator_id=${encodeURIComponent(indicatorId)}` : '';
+    const request = fetch(`/api/geoobject/${id}${query}`).then((r) => r.json());
+    geoobjectLabels.set(key, request);
+    request.then((label) => geoobjectLabels.set(key, label), () => geoobjectLabels.delete(key));
   }
+  return Promise.resolve(geoobjectLabels.get(key));
+}
+
+const formatValue = (value) => (value == null ? 'Dado indisponível' : Number(value).toFixed(4));
+
+// Popup value text: the exact value -- from feature-state (state/municipality)
+// or fetched on hover (Brasil) -- else the legend item, while the Brasil
+// value is still loading.
+function tipText(state, label) {
+  if ('value' in state) return formatValue(state.value);
+  if (label && 'value' in label) return formatValue(label.value);
   const item = currentLegend[state.c] || {};
   return item.label + (item.minvalue != null ? ` (${legendRange(item)})` : '');
 }
@@ -292,16 +309,27 @@ function ensureMap() {
     map.on('load', async () => {
       try {
         const config = await fetchJson('/api/tiles/config');
-        const tileSource = (path) => ({
+        // ?v=: the set's version, so a rebuilt set isn't served from the
+        // browser's cache (tiles are cached for a day).
+        const tileSource = (path, kind) => ({
           type: 'vector',
-          tiles: [`${location.origin}${path}/{z}/{x}/{y}.pbf`],
+          tiles: [`${location.origin}${path}/{z}/{x}/{y}.pbf?v=${config.versions[kind]}`],
           minzoom: config.minzoom,
           maxzoom: config.maxzoom,
           bounds: config.bounds.flat()
         });
-        map.addSource('tracts', tileSource('/api/tiles'));
+        map.addSource('tracts', tileSource('/api/tiles', 'tracts'));
         // State and municipality lines, drawn over the tract colors.
-        map.addSource('boundaries', tileSource('/api/boundaries'));
+        map.addSource('boundaries', tileSource('/api/boundaries', 'boundaries'));
+        // Municipality polygons: the country map below countyFillMaxZoom.
+        countyFillMaxZoom = config.county_fill_maxzoom;
+        fillSwitchZoom();
+        map.on('zoom', updateZoomBox);
+        updateZoomBox();
+        map.addSource('counties', {
+          ...tileSource('/api/municipalities', 'counties'),
+          maxzoom: countyFillMaxZoom - 1
+        });
       } catch (err) {
         reject(err);
         return;
@@ -315,6 +343,21 @@ function ensureMap() {
           'fill-color': ['coalesce', ['feature-state', 'color'], '#888888'],
           'fill-opacity': ['case', ['!', hasColor], 0, isHovered, 0.95, 0.78],
           // Antialiasing draws faint seams between adjacent polygons.
+          'fill-antialias': false
+        }
+      });
+      // Country map below countyFillMaxZoom: municipalities colored by the
+      // mean of their tracts' values (hidden on state maps).
+      map.addLayer({
+        id: 'counties-fill',
+        type: 'fill',
+        source: 'counties',
+        'source-layer': 'counties',
+        maxzoom: countyFillMaxZoom,
+        layout: { visibility: 'none' },
+        paint: {
+          'fill-color': ['coalesce', ['feature-state', 'color'], '#888888'],
+          'fill-opacity': ['case', ['!', hasColor], 0, isHovered, 0.95, 0.78],
           'fill-antialias': false
         }
       });
@@ -375,16 +418,31 @@ function ensureMap() {
           'line-opacity': ['case', isHovered, 1, 0]
         }
       });
+      map.addLayer({
+        id: 'counties-hover',
+        type: 'line',
+        source: 'counties',
+        'source-layer': 'counties',
+        maxzoom: countyFillMaxZoom,
+        layout: { visibility: 'none' },
+        paint: {
+          'line-color': '#0b3d2e',
+          'line-width': 2.2,
+          'line-opacity': ['case', isHovered, 1, 0]
+        }
+      });
 
-      let hoveredId = null;
-      const setHover = (id) => {
-        if (hoveredId === id) return;
-        if (hoveredId != null) map.setFeatureState({ ...TRACTS, id: hoveredId }, { hover: false });
-        hoveredId = id;
-        if (id != null) map.setFeatureState({ ...TRACTS, id }, { hover: true });
+      // Hovered feature: { target (TRACTS or COUNTIES), id }.
+      let hovered = null;
+      const setHover = (target, id) => {
+        if (hovered && hovered.target === target && hovered.id === id) return;
+        if (hovered) map.setFeatureState({ ...hovered.target, id: hovered.id }, { hover: false });
+        hovered = id == null ? null : { target, id };
+        if (hovered) map.setFeatureState({ ...target, id }, { hover: true });
       };
+      const isHoveredFeature = (target, id) => hovered && hovered.target === target && hovered.id === id;
       const clearHover = () => {
-        setHover(null);
+        setHover(null, null);
         map.getCanvas().style.cursor = '';
         popup.remove();
       };
@@ -399,24 +457,52 @@ function ensureMap() {
       map.on('mousemove', 'tracts-fill', (e) => {
         const feature = e.features.find((f) => f.state && f.state.color != null);
         if (!feature) return clearHover();
-        setHover(feature.id);
+        setHover(TRACTS, feature.id);
         map.getCanvas().style.cursor = 'pointer';
         const { color } = feature.state;
-        const text = tipText(feature.state);
+        // Brasil tracts carry a class (c), not a value: fetch the value too.
+        const indicatorId = 'value' in feature.state ? null : brasilIndicatorId;
         const show = (label) => {
-          if (hoveredId === feature.id) {
-            popup.setLngLat(e.lngLat).setHTML(tipHtml(label, color, text)).addTo(map);
+          if (isHoveredFeature(TRACTS, feature.id)) {
+            popup.setLngLat(e.lngLat)
+              .setHTML(tipHtml(label, color, tipText(feature.state, label)))
+              .addTo(map);
           }
         };
-        const label = geoobjectLabels.get(feature.id);
+        const label = geoobjectLabels.get(labelKey(feature.id, indicatorId));
         if (label && !(label instanceof Promise)) {
           show(label);
         } else {
           show({});
-          getGeoobjectLabel(feature.id).then(show).catch(() => {});
+          getGeoobjectLabel(feature.id, indicatorId).then(show).catch(() => {});
         }
       });
       map.on('mouseleave', 'tracts-fill', clearHover);
+
+      // Municipalities (country map, low zoom): name + mean of their tracts.
+      map.on('mousemove', 'counties-fill', (e) => {
+        const feature = e.features.find((f) => f.state && f.state.color != null);
+        if (!feature) return clearHover();
+        setHover(COUNTIES, feature.id);
+        map.getCanvas().style.cursor = 'pointer';
+        const { color } = feature.state;
+        const show = (label) => {
+          if (isHoveredFeature(COUNTIES, feature.id)) {
+            const title = { name: label.name, county_name: 'Média dos setores censitários' };
+            popup.setLngLat(e.lngLat)
+              .setHTML(tipHtml(title, color, tipText(feature.state)))
+              .addTo(map);
+          }
+        };
+        const label = geoobjectLabels.get(labelKey(feature.id, null));
+        if (label && !(label instanceof Promise)) {
+          show(label);
+        } else {
+          show({});
+          getGeoobjectLabel(feature.id, null).then(show).catch(() => {});
+        }
+      });
+      map.on('mouseleave', 'counties-fill', clearHover);
 
       resolve(map);
     });
@@ -427,12 +513,73 @@ function ensureMap() {
 
 // Give the tracts in `states` (id -> feature-state) their color; every other
 // tract becomes invisible. Feature-state applies to tiles loaded later too.
-function paintTracts(readyMap, states) {
-  readyMap.removeFeatureState(TRACTS);
+function paintTracts(readyMap, states, target = TRACTS) {
+  readyMap.removeFeatureState(target);
   for (const [id, state] of states) {
-    readyMap.setFeatureState({ ...TRACTS, id }, state);
+    readyMap.setFeatureState({ ...target, id }, state);
   }
 }
+
+// Country map: municipality polygons below countyFillMaxZoom, tracts from it
+// on. State/municipality maps: tracts at every zoom.
+let brasilMode = false;
+
+function applyLayerZooms(readyMap) {
+  for (const id of ['counties-fill', 'counties-hover']) {
+    readyMap.setLayerZoomRange(id, 0, countyFillMaxZoom);
+  }
+  for (const id of ['tracts-fill', 'tracts-hover']) {
+    readyMap.setLayerZoomRange(id, brasilMode ? countyFillMaxZoom : 0, 24);
+  }
+}
+
+function setBrasilMode(readyMap, on) {
+  brasilMode = on;
+  for (const id of ['counties-fill', 'counties-hover']) {
+    readyMap.setLayoutProperty(id, 'visibility', on ? 'visible' : 'none');
+  }
+  applyLayerZooms(readyMap);
+  if (!on) readyMap.removeFeatureState(COUNTIES);
+  updateZoomBox();
+}
+
+// --- Zoom readout + switch level (testing aid) ---------------------------------
+// Shows the current zoom and what's drawn; on the Brasil map, a select moves
+// the zoom where municipalities give way to tracts (not saved: the server's
+// COUNTY_FILL_MAX_ZOOM is the default on every page load).
+const zoomLevel = document.getElementById('zoomLevel');
+const zoomShowing = document.getElementById('zoomShowing');
+const switchField = document.getElementById('switchField');
+const switchZoom = document.getElementById('switchZoom');
+
+function updateZoomBox() {
+  if (!map) return;
+  const zoom = map.getZoom();
+  zoomLevel.textContent = zoom.toFixed(1);
+  if (currentAreaKey == null) {
+    zoomShowing.textContent = '';
+  } else {
+    zoomShowing.textContent = brasilMode && zoom < countyFillMaxZoom ? '· municípios' : '· setores';
+  }
+  switchField.hidden = !brasilMode;
+}
+
+function fillSwitchZoom() {
+  switchZoom.innerHTML = '';
+  for (let z = 4; z <= 12; z++) {
+    const option = document.createElement('option');
+    option.value = z;
+    option.textContent = z;
+    switchZoom.appendChild(option);
+  }
+  switchZoom.value = countyFillMaxZoom;
+}
+
+switchZoom.addEventListener('change', () => {
+  countyFillMaxZoom = Number(switchZoom.value);
+  if (map) applyLayerZooms(map);
+  updateZoomBox();
+});
 
 // Area (state:county or Brasil) the map is zoomed to, so it only refits when
 // the area changes.
@@ -448,6 +595,7 @@ function finishLoading(startTime, text) {
   const seconds = ((performance.now() - startTime) / 1000).toFixed(1);
   loadStatus.textContent = `${text} em ${seconds} seg`;
   loadStatus.dataset.state = 'ok';
+  updateZoomBox();
 }
 
 // --- Whole country (Brasil) ------------------------------------------------------
@@ -476,9 +624,11 @@ async function loadBrasilMap(load) {
   const indicatorId = indicatorSelect.value;
   const classesUrl = `/api/brasil/classes?indicator_id=${encodeURIComponent(indicatorId)}`;
   const legendUrl = `/api/legend?indicator_id=${encodeURIComponent(indicatorId)}`;
-  const [ids, classes, legend, readyMap] = await Promise.all([
+  const countiesUrl = `/api/brasil/counties?indicator_id=${encodeURIComponent(indicatorId)}`;
+  const [ids, classes, counties, legend, readyMap] = await Promise.all([
     getBrasilIds(),
     apiFetch(classesUrl, { signal: load.signal }),
+    apiFetch(countiesUrl, { signal: load.signal }),
     apiFetch(legendUrl, { signal: load.signal }),
     ensureMap()
   ]);
@@ -491,6 +641,7 @@ async function loadBrasilMap(load) {
   if (debugCheckbox.checked) {
     appendDebugSql('GET /api/brasil/ids', ids.sql || ['-- (carregada com o Debug desligado)']);
     appendDebugSql(`GET ${classesUrl}`, classes.sql);
+    appendDebugSql(`GET ${countiesUrl}`, counties.sql);
     appendDebugSql(`GET ${legendUrl}`, legend.sql);
   }
 
@@ -502,6 +653,16 @@ async function loadBrasilMap(load) {
     if (c >= 0) states.push([ids.ids[i], { c, color: colors[c] }]);
   }
   paintTracts(readyMap, states);
+  // Municipalities: class of the mean of their tracts' values.
+  const county = counties.data;
+  const countyStates = [];
+  for (let i = 0; i < county.ids.length; i++) {
+    const k = county.classes.charCodeAt(i) - 48;
+    if (k >= 0) countyStates.push([county.ids[i], { c: k, color: colors[k], value: county.values[i] }]);
+  }
+  paintTracts(readyMap, countyStates, COUNTIES);
+  setBrasilMode(readyMap, true);
+  brasilIndicatorId = indicatorId;
   renderLegend(indicatorSelect.selectedOptions[0].textContent, legend.data);
   if (currentAreaKey !== 'BR') readyMap.fitBounds(BRAZIL_BOUNDS, { padding: 20, duration: 500 });
   currentAreaKey = 'BR';
@@ -530,6 +691,7 @@ async function loadAreaMap(load) {
   }
 
   const rows = values.data;
+  setBrasilMode(readyMap, false);
   paintTracts(readyMap, rows.map((row) => [row.geoobject_id, { color: row.color, value: row.value }]));
   renderLegend(indicatorSelect.selectedOptions[0].textContent, legend.data);
   const areaKey = scope.toString();
