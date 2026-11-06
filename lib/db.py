@@ -133,13 +133,6 @@ def fetch_counties(state_id):
     return query_df(sql, {"state_id": state_id})
 
 
-# Whole-state requests can span tens of thousands of sub-county polygons, so
-# their boundaries are simplified in degrees (~55m at Brazil's latitude) --
-# finer detail than that isn't visible at state zoom anyway. County-scoped
-# requests cover few enough polygons that they're served at full resolution.
-STATE_VIEW_SIMPLIFY_TOLERANCE = 0.0005
-
-
 def _scope_filter(state_id, county_id, alias):
     """WHERE clause + params limiting geoobjects to a state, or to one county.
 
@@ -151,58 +144,35 @@ def _scope_filter(state_id, county_id, alias):
     return f"{alias}.state_id = :state_id", {"state_id": state_id}
 
 
-def fetch_geometry_geojson(state_id, county_id=None):
-    """Return the area's geometry as a GeoJSON string (see _geometry())."""
-    hits = _geometry.cache_info().hits
-    fc, sql = _geometry(state_id, county_id)
-    if _geometry.cache_info().hits > hits:
-        # Nothing ran this time; show the query that built the cached copy.
-        log_sql(f"-- served from the server's geometry cache; built by:\n{sql}")
-    return fc
+def fetch_bounds(state_id, county_id=None):
+    """[[west, south], [east, north]] of a state or a municipality (see
+    _bounds()), or None if it has no geometry."""
+    hits = _bounds.cache_info().hits
+    bounds, sql = _bounds(state_id, county_id)
+    if _bounds.cache_info().hits > hits:
+        log_sql(f"-- served from the server's bounds cache; built by:\n{sql}")
+    return bounds
 
 
-@lru_cache(maxsize=32)
-def _geometry(state_id, county_id=None):
-    """Return the geoobjects of a state (or of one county) as a GeoJSON
-    FeatureCollection string. Each feature's id is its geoobject id, and its
-    properties carry the labels shown on hover (name, county_name), which
-    don't depend on the indicator.
-
-    Geometry doesn't depend on the indicator, so it's fetched once per
-    state/county and cached; indicator values are fetched separately by
-    fetch_values() and joined to these features by id on the client.
-    The JSON is built by Postgres and cached already serialized, so cache hits
-    skip both the database and Python-side JSON encoding. Returns
-    (geojson_text, sql_with_params).
-    """
+@lru_cache(maxsize=256)
+def _bounds(state_id, county_id=None):
+    """Extent of the municipality, or of all the state's municipalities
+    (geoobjects whose county_id is their own id) -- a few hundred polygons,
+    instead of the state's tens of thousands of tracts. Cached: geometry
+    doesn't change. Returns (bounds, sql_with_params)."""
     schema = get_schema()
-    where, params = _scope_filter(state_id, county_id, "g")
     if county_id:
-        geom_sql = "ST_AsGeoJSON(g.geom, 6)"
+        where, params = "g.id = :county_id", {"county_id": county_id}
     else:
-        geom_sql = "ST_AsGeoJSON(ST_SimplifyPreserveTopology(g.geom, :tolerance), 4)"
-        params["tolerance"] = STATE_VIEW_SIMPLIFY_TOLERANCE
-    # name/county_name are built the same way as in the geovalue view.
+        where, params = "g.state_id = :state_id and g.county_id = g.id", {"state_id": state_id}
     sql = (
-        f"select json_build_object("
-        f"  'type', 'FeatureCollection',"
-        f"  'features', coalesce(json_agg(json_build_object("
-        f"    'type', 'Feature', 'id', g.id,"
-        f"    'properties', json_build_object("
-        f"      'name', case when g.state is null then g.name::text"
-        f"                   else concat(g.name, '/', g.state) end,"
-        f"      'county_name', c.name),"
-        f"    'geometry', {geom_sql}::json"
-        f"  )), '[]'::json)"
-        f")::text as fc "
-        f"from {schema}.geoobject g "
-        f"left join {schema}.geoobject c on c.id = g.county_id "
-        f"where {where} and g.geom is not null"
+        f"select ST_XMin(e) as w, ST_YMin(e) as s, ST_XMax(e) as e, ST_YMax(e) as n "
+        f"from (select ST_Extent(g.geom) as e from {schema}.geoobject g where {where}) t"
     )
     with get_engine().connect() as conn:
-        fc = conn.execute(text(sql), params).scalar_one()
-    # Kept with the cached result, so debug output can show it on cache hits.
-    return fc, render_sql(sql, params)
+        row = conn.execute(text(sql), params).one()
+    bounds = None if row.w is None else [[row.w, row.s], [row.e, row.n]]
+    return bounds, render_sql(sql, params)
 
 
 def fetch_legend(indicator_id):
@@ -257,15 +227,37 @@ def fetch_values(indicator_id, state_id, county_id=None):
         f"    offset 0"
         f"  ) v"
         f") "
+        # Legend item: the one with the highest minvalue <= value. Matching
+        # `value >= minvalue and value < maxvalue` instead would drop values
+        # in the gaps between ranges (0.19 .. 0.20) and at the top bound
+        # (1.00 -- 149k tracts for some indicators). Same rule as
+        # brasil.classify().
         f"select vals.geoobject_id, vals.value, li.color from vals "
-        f"join {schema}.legend_items li "
-        f"  on li.legend_id = (select legend_id from {schema}.indicator where id = :indicator_id) "
-        f" and (vals.value >= li.minvalue and vals.value < li.maxvalue "
-        f"      or vals.value is null and li.minvalue is null)"
+        f"cross join lateral ("
+        f"  select li.color from {schema}.legend_items li "
+        f"  where li.legend_id = (select legend_id from {schema}.indicator where id = :indicator_id) "
+        f"    and (vals.value >= li.minvalue or vals.value is null and li.minvalue is null) "
+        f"  order by li.minvalue desc nulls last limit 1"
+        f") li"
     )
     df = query_df(sql, params)
     # NaN isn't valid JSON; send missing values as null.
     return df.astype(object).where(df.notna(), None).to_dict(orient="records")
+
+
+def fetch_geoobject_label(geoobject_id):
+    """Name and municipality name of one geoobject, as on the state map's
+    hover popup."""
+    schema = get_schema()
+    df = query_df(
+        f"select case when g.state is null then g.name::text "
+        f"            else concat(g.name, '/', g.state) end as name, "
+        f"       c.name::text as county_name "
+        f"from {schema}.geoobject g left join {schema}.geoobject c on c.id = g.county_id "
+        f"where g.id = :id",
+        {"id": geoobject_id},
+    )
+    return df.to_dict(orient="records")[0] if len(df) else {"name": None, "county_name": None}
 
 
 # Areas warmed recently (key -> monotonic time) and areas being warmed now,

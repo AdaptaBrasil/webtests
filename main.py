@@ -10,10 +10,10 @@ load_dotenv(override=True)
 
 from fastapi import BackgroundTasks, FastAPI, Query, Request
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from lib import db
+from lib import brasil, db
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -84,19 +84,16 @@ def api_counties(state_id: int = Query(...)):
     return db.fetch_counties(state_id).to_dict(orient="records")
 
 
-@app.get("/api/geometry")
-def api_geometry(
+@app.get("/api/bounds")
+def api_bounds(
     state_id: int = Query(...),
     county_id: Optional[int] = Query(None),
 ):
-    # Geoobject boundaries don't change between indicators, so let the browser
-    # cache them too.
-    return Response(
-        content=db.fetch_geometry_geojson(state_id, county_id),
-        media_type="application/json",
-        # Vary: a cached copy without debug SQL mustn't answer a debug request.
-        headers={"Cache-Control": "public, max-age=86400", "Vary": "X-Debug-SQL"},
-    )
+    """[[west, south], [east, north]] of a state or municipality, to zoom the
+    map to it. The polygons themselves come from /api/tiles."""
+    bounds = db.fetch_bounds(state_id, county_id)
+    db.log_sql(brasil.tile_debug_sql())
+    return bounds
 
 
 @app.get("/api/values")
@@ -127,6 +124,58 @@ def api_warm(
         + db.render_sql(*db.warm_sql(state_id, county_id))
     )
     return {"status": "warming"}
+
+
+# --- vector tiles and the whole-country map (see lib/brasil.py) ---------------
+
+@app.get("/api/tiles/config")
+def api_tiles_config():
+    return brasil.tiles_config()
+
+
+@app.get("/api/brasil/ids")
+def api_brasil_ids():
+    # The tract list only changes when geometry is reloaded; the version in
+    # the payload is checked against each class string's.
+    return JSONResponse(
+        brasil.tract_ids_payload(),
+        headers={"Cache-Control": "public, max-age=86400", "Vary": "X-Debug-SQL"},
+    )
+
+
+@app.get("/api/brasil/classes")
+def api_brasil_classes(indicator_id: int = Query(...)):
+    result = brasil.fetch_classes(indicator_id)
+    db.log_sql(brasil.tile_debug_sql())
+    return result
+
+
+def _tile_response(z, x, y, kind):
+    if not (brasil.MIN_ZOOM <= z <= brasil.MAX_ZOOM and 0 <= x < 2 ** z and 0 <= y < 2 ** z):
+        return Response(status_code=404)
+    return Response(
+        content=brasil.fetch_tile(z, x, y, kind),
+        media_type="application/x-protobuf",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+@app.get("/api/tiles/{z}/{x}/{y}.pbf")
+def api_tile(z: int, x: int, y: int):
+    """Census tract polygons (layer "tracts")."""
+    return _tile_response(z, x, y, "tracts")
+
+
+@app.get("/api/boundaries/{z}/{x}/{y}.pbf")
+def api_boundary_tile(z: int, x: int, y: int):
+    """State and municipality boundary lines (layers "states", "counties")."""
+    return _tile_response(z, x, y, "boundaries")
+
+
+@app.get("/api/geoobject/{geoobject_id}")
+def api_geoobject(geoobject_id: int):
+    """Name and municipality of one geoobject (hover popup on the country map)."""
+    return db.fetch_geoobject_label(geoobject_id)
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

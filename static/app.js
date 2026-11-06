@@ -108,13 +108,21 @@ async function loadIndicators(sepId) {
   indicatorSelect.disabled = false;
 }
 
+// "Estado" value for the whole country (see loadBrasilMap()).
+const BRASIL = 'BR';
+const isBrasil = () => stateSelect.value === BRASIL;
+
 async function loadStates() {
   const data = await fetchJson('/api/states');
   fillSelect(stateSelect, data, 'id', 'state', '(selecione)');
+  const brasil = document.createElement('option');
+  brasil.value = BRASIL;
+  brasil.textContent = 'Brasil';
+  stateSelect.insertBefore(brasil, stateSelect.options[1]);
 }
 
 async function loadCounties(stateId) {
-  if (!stateId) {
+  if (!stateId || stateId === BRASIL) {
     countySelect.innerHTML = '<option value="">(selecione)</option>';
     countySelect.disabled = true;
     return;
@@ -128,10 +136,20 @@ sepSelect.addEventListener('change', () => {
   loadIndicators(sepSelect.value);
   updateLoadButtonState();
 });
-// Geometry requests by URL, so a prefetch started when an area is picked is
-// reused (not repeated) when the map is loaded.
-const geometryRequests = new Map();
-const MAX_CACHED_GEOMETRIES = 4;
+
+// --- Map -----------------------------------------------------------------------
+// Polygons always come from one vector tile source (/api/tiles/{z}/{x}/{y}.pbf,
+// all census tracts of Brazil, built by PostGIS): the browser only loads the
+// tiles in view, simplified for the zoom, so a whole state or the whole
+// country doesn't mean downloading every polygon. Tiles carry only the
+// geoobject id. Which tracts are shown, and their colors, come from
+// feature-state set per indicator; tracts without state stay invisible.
+//   * state / municipality: /api/values (value + legend color per tract);
+//   * Brasil: a precomputed "class string" (legend item per tract, see
+//     loadBrasilMap()).
+
+const TRACTS = { source: 'tracts', sourceLayer: 'tracts' };
+const BRAZIL_BOUNDS = [[-74.0, -33.8], [-34.7, 5.3]];
 
 function areaParams() {
   const params = new URLSearchParams({ state_id: stateSelect.value });
@@ -139,31 +157,33 @@ function areaParams() {
   return params;
 }
 
-function getGeometry(params) {
-  const url = `/api/geometry?${params.toString()}`;
+// Area bounds by URL, so a prefetch started when an area is picked is reused.
+const boundsRequests = new Map();
+
+function getBounds(params) {
+  const url = `/api/bounds?${params.toString()}`;
   // Keyed by debug mode too: a copy fetched without debug carries no SQL.
   const key = `${debugCheckbox.checked}|${url}`;
-  if (!geometryRequests.has(key)) {
+  if (!boundsRequests.has(key)) {
     const request = apiFetch(url).then(({ data, sql }) => ({ data, sql, url }));
-    // Drop failed requests so the next attempt retries.
-    request.catch(() => geometryRequests.delete(key));
-    geometryRequests.set(key, request);
-    // Keep only the most recent areas; large states are several MB each.
-    while (geometryRequests.size > MAX_CACHED_GEOMETRIES) {
-      geometryRequests.delete(geometryRequests.keys().next().value);
-    }
+    request.catch(() => boundsRequests.delete(key));
+    boundsRequests.set(key, request);
   }
-  return geometryRequests.get(key);
+  return boundsRequests.get(key);
 }
 
 // While the user is still choosing an indicator, have the server read the
 // area's values (so the first map for a state isn't slowed by cold disk
-// reads) and fetch its geometry. Both are fire-and-forget.
+// reads) and fetch what the map needs. Fire-and-forget.
 function warmArea() {
   if (!stateSelect.value) return;
+  if (isBrasil()) {
+    getBrasilIds().catch(() => {});
+    return;
+  }
   const params = areaParams();
   fetchJson(`/api/warm?${params.toString()}`, { method: 'POST' }).catch(() => {});
-  getGeometry(params).catch(() => {});
+  getBounds(params).catch(() => {});
 }
 
 stateSelect.addEventListener('change', () => {
@@ -177,29 +197,62 @@ countySelect.addEventListener('change', () => {
   warmArea();
 });
 
-function computeBounds(geojson) {
-  let bounds = null;
-  const extend = (lng, lat) => {
-    if (!bounds) {
-      bounds = [[lng, lat], [lng, lat]];
-    } else {
-      bounds[0][0] = Math.min(bounds[0][0], lng);
-      bounds[0][1] = Math.min(bounds[0][1], lat);
-      bounds[1][0] = Math.max(bounds[1][0], lng);
-      bounds[1][1] = Math.max(bounds[1][1], lat);
-    }
-  };
-  const walk = (coords) => {
-    if (typeof coords[0] === 'number') {
-      extend(coords[0], coords[1]);
-    } else {
-      coords.forEach(walk);
-    }
-  };
-  for (const feature of geojson.features) {
-    if (feature.geometry) walk(feature.geometry.coordinates);
+// Legend ranges in Brazilian format, as AdaptaBrasil shows them: "0,00 a 0,19".
+const rangeFormat = new Intl.NumberFormat('pt-BR', {
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 2
+});
+const legendRange = (item) => `${rangeFormat.format(item.minvalue)} a ${rangeFormat.format(item.maxvalue)}`;
+// Legend items of the indicator on the map (Brasil: class index -> item).
+let currentLegend = [];
+
+function renderLegend(title, items) {
+  currentLegend = items;
+  legendTitle.textContent = title;
+  legendItems.replaceChildren(
+    ...items.map((item) => {
+      const row = document.createElement('div');
+      row.className = 'legend-row';
+      const swatch = document.createElement('span');
+      swatch.className = 'legend-swatch';
+      swatch.style.background = item.color;
+      const label = document.createElement('span');
+      label.className = 'legend-label';
+      label.textContent = item.label;
+      row.append(swatch, label);
+      if (item.minvalue != null && item.maxvalue != null) {
+        const range = document.createElement('span');
+        range.className = 'legend-range';
+        range.textContent = legendRange(item);
+        row.append(range);
+      }
+      return row;
+    })
+  );
+  legendBox.hidden = items.length === 0;
+}
+
+// geoobject id -> {name, county_name} (or the pending request), for hover:
+// tiles carry no names.
+const geoobjectLabels = new Map();
+
+function getGeoobjectLabel(id) {
+  if (!geoobjectLabels.has(id)) {
+    const request = fetch(`/api/geoobject/${id}`).then((r) => r.json());
+    geoobjectLabels.set(id, request);
+    request.then((label) => geoobjectLabels.set(id, label), () => geoobjectLabels.delete(id));
   }
-  return bounds;
+  return Promise.resolve(geoobjectLabels.get(id));
+}
+
+// Popup value text: the exact value (state/municipality), or the legend
+// item (Brasil, where only the class is precomputed).
+function tipText(state) {
+  if ('value' in state) {
+    return state.value == null ? 'Dado indisponível' : Number(state.value).toFixed(4);
+  }
+  const item = currentLegend[state.c] || {};
+  return item.label + (item.minvalue != null ? ` (${legendRange(item)})` : '');
 }
 
 function ensureMap() {
@@ -232,78 +285,119 @@ function ensureMap() {
   map.addControl(new maplibregl.NavigationControl(), 'top-right');
 
   const popup = new maplibregl.Popup({ closeButton: false, closeOnClick: false, offset: 12, className: 'geo-tip' });
+  const hasColor = ['!=', ['feature-state', 'color'], null];
+  const isHovered = ['boolean', ['feature-state', 'hover'], false];
 
-  // Polygons are drawn from the geometry source; their color and visibility
-  // come from per-feature state set by applyValues(), so switching indicators
-  // only updates feature state instead of reloading geometry. Geoobjects
-  // without a value for the current indicator stay invisible.
-  const hasValue = ['boolean', ['feature-state', 'hasValue'], false];
-
-  mapReadyPromise = new Promise((resolve) => {
-    map.on('load', () => {
-      map.addSource('geoobjects', {
-        type: 'geojson',
-        data: { type: 'FeatureCollection', features: [] }
-      });
+  mapReadyPromise = new Promise((resolve, reject) => {
+    map.on('load', async () => {
+      try {
+        const config = await fetchJson('/api/tiles/config');
+        const tileSource = (path) => ({
+          type: 'vector',
+          tiles: [`${location.origin}${path}/{z}/{x}/{y}.pbf`],
+          minzoom: config.minzoom,
+          maxzoom: config.maxzoom,
+          bounds: config.bounds.flat()
+        });
+        map.addSource('tracts', tileSource('/api/tiles'));
+        // State and municipality lines, drawn over the tract colors.
+        map.addSource('boundaries', tileSource('/api/boundaries'));
+      } catch (err) {
+        reject(err);
+        return;
+      }
       map.addLayer({
-        id: 'geovalue-fill',
+        id: 'tracts-fill',
         type: 'fill',
-        source: 'geoobjects',
+        source: 'tracts',
+        'source-layer': 'tracts',
         paint: {
           'fill-color': ['coalesce', ['feature-state', 'color'], '#888888'],
-          'fill-opacity': [
-            'case',
-            ['!', hasValue], 0,
-            ['boolean', ['feature-state', 'hover'], false], 0.95,
-            0.78
-          ]
+          'fill-opacity': ['case', ['!', hasColor], 0, isHovered, 0.95, 0.78],
+          // Antialiasing draws faint seams between adjacent polygons.
+          'fill-antialias': false
+        }
+      });
+      // Municipality lines from zoom 6 (the tiles only carry them from there),
+      // thin and translucent; state lines at every zoom, darker and wider.
+      map.addLayer({
+        id: 'county-lines',
+        type: 'line',
+        source: 'boundaries',
+        'source-layer': 'counties',
+        minzoom: 6,
+        paint: {
+          'line-color': '#ffffff',
+          'line-opacity': ['interpolate', ['linear'], ['zoom'], 6, 0.35, 10, 0.7],
+          'line-width': ['interpolate', ['linear'], ['zoom'], 6, 0.4, 10, 1, 14, 1.6]
         }
       });
       map.addLayer({
-        id: 'geovalue-outline',
+        id: 'state-lines',
         type: 'line',
-        source: 'geoobjects',
+        source: 'boundaries',
+        'source-layer': 'states',
+        layout: { 'line-join': 'round' },
         paint: {
-          'line-color': ['case', ['boolean', ['feature-state', 'hover'], false], '#0b3d2e', '#2b2b2b'],
-          'line-width': ['case', ['boolean', ['feature-state', 'hover'], false], 2.2, 0.5],
-          'line-opacity': ['case', hasValue, 1, 0]
+          'line-color': '#1b2a33',
+          'line-opacity': 0.85,
+          'line-width': ['interpolate', ['linear'], ['zoom'], 2, 0.6, 6, 1.4, 10, 2.4]
+        }
+      });
+      // No lines between tracts: only the one under the mouse gets an outline.
+      map.addLayer({
+        id: 'tracts-hover',
+        type: 'line',
+        source: 'tracts',
+        'source-layer': 'tracts',
+        paint: {
+          'line-color': '#0b3d2e',
+          'line-width': 2.2,
+          'line-opacity': ['case', isHovered, 1, 0]
         }
       });
 
       let hoveredId = null;
       const setHover = (id) => {
         if (hoveredId === id) return;
-        if (hoveredId != null) map.setFeatureState({ source: 'geoobjects', id: hoveredId }, { hover: false });
+        if (hoveredId != null) map.setFeatureState({ ...TRACTS, id: hoveredId }, { hover: false });
         hoveredId = id;
-        if (id != null) map.setFeatureState({ source: 'geoobjects', id }, { hover: true });
+        if (id != null) map.setFeatureState({ ...TRACTS, id }, { hover: true });
       };
-
-      map.on('mousemove', 'geovalue-fill', (e) => {
-        const feature = e.features.find((f) => currentValues.has(f.id));
-        if (!feature) {
-          setHover(null);
-          map.getCanvas().style.cursor = '';
-          popup.remove();
-          return;
-        }
-        setHover(feature.id);
-        map.getCanvas().style.cursor = 'pointer';
-        const { county_name, name } = feature.properties;
-        const { value, color } = currentValues.get(feature.id);
-        const html = `
-          <div class="tip-title">${name}</div>
-          <div class="tip-sub">${county_name}</div>
-          <div class="tip-value">
-            <span class="tip-dot" style="background:${color || '#dcdcdc'}"></span>
-            ${value == null ? 'Dado indisponível' : Number(value).toFixed(4)}
-          </div>`;
-        popup.setLngLat(e.lngLat).setHTML(html).addTo(map);
-      });
-      map.on('mouseleave', 'geovalue-fill', () => {
+      const clearHover = () => {
         setHover(null);
         map.getCanvas().style.cursor = '';
         popup.remove();
+      };
+      const tipHtml = (label, color, text) => `
+          <div class="tip-title">${label.name ?? '…'}</div>
+          <div class="tip-sub">${label.county_name ?? ''}</div>
+          <div class="tip-value">
+            <span class="tip-dot" style="background:${color || '#dcdcdc'}"></span>
+            ${text}
+          </div>`;
+
+      map.on('mousemove', 'tracts-fill', (e) => {
+        const feature = e.features.find((f) => f.state && f.state.color != null);
+        if (!feature) return clearHover();
+        setHover(feature.id);
+        map.getCanvas().style.cursor = 'pointer';
+        const { color } = feature.state;
+        const text = tipText(feature.state);
+        const show = (label) => {
+          if (hoveredId === feature.id) {
+            popup.setLngLat(e.lngLat).setHTML(tipHtml(label, color, text)).addTo(map);
+          }
+        };
+        const label = geoobjectLabels.get(feature.id);
+        if (label && !(label instanceof Promise)) {
+          show(label);
+        } else {
+          show({});
+          getGeoobjectLabel(feature.id).then(show).catch(() => {});
+        }
       });
+      map.on('mouseleave', 'tracts-fill', clearHover);
 
       resolve(map);
     });
@@ -312,114 +406,124 @@ function ensureMap() {
   return mapReadyPromise;
 }
 
-// Key ("state:county") of the geometry currently in the map's source, so
-// geometry is only fetched and redrawn when the state/county changes.
-let currentGeometryKey = null;
-// Debug: { url, sql } of the request that produced the geometry on the map.
-let currentGeometryDebug = null;
-let currentBounds = null;
-// geoobject_id -> {value, color} row for the indicator currently shown.
-let currentValues = new Map();
-
-// Legend ranges in Brazilian format, as AdaptaBrasil shows them: "0,00 a 0,19".
-const rangeFormat = new Intl.NumberFormat('pt-BR', {
-  minimumFractionDigits: 2,
-  maximumFractionDigits: 2
-});
-
-function renderLegend(title, items) {
-  legendTitle.textContent = title;
-  legendItems.replaceChildren(
-    ...items.map((item) => {
-      const row = document.createElement('div');
-      row.className = 'legend-row';
-      const swatch = document.createElement('span');
-      swatch.className = 'legend-swatch';
-      swatch.style.background = item.color;
-      const label = document.createElement('span');
-      label.className = 'legend-label';
-      label.textContent = item.label;
-      row.append(swatch, label);
-      if (item.minvalue != null && item.maxvalue != null) {
-        const range = document.createElement('span');
-        range.className = 'legend-range';
-        range.textContent = `${rangeFormat.format(item.minvalue)} a ${rangeFormat.format(item.maxvalue)}`;
-        row.append(range);
-      }
-      return row;
-    })
-  );
-  legendBox.hidden = items.length === 0;
-}
-
-function applyValues(readyMap, rows) {
-  readyMap.removeFeatureState({ source: 'geoobjects' });
-  currentValues = new Map();
-  for (const row of rows) {
-    currentValues.set(row.geoobject_id, row);
-    readyMap.setFeatureState(
-      { source: 'geoobjects', id: row.geoobject_id },
-      { hasValue: true, color: row.color }
-    );
+// Give the tracts in `states` (id -> feature-state) their color; every other
+// tract becomes invisible. Feature-state applies to tiles loaded later too.
+function paintTracts(readyMap, states) {
+  readyMap.removeFeatureState(TRACTS);
+  for (const [id, state] of states) {
+    readyMap.setFeatureState({ ...TRACTS, id }, state);
   }
 }
 
-async function loadMapData() {
-  const stateId = stateSelect.value;
-  const countyId = countySelect.value;
-  const scope = areaParams();
-  const valueParams = new URLSearchParams(scope);
-  valueParams.set('indicator_id', indicatorSelect.value);
+// Area (state:county or Brasil) the map is zoomed to, so it only refits when
+// the area changes.
+let currentAreaKey = null;
 
-  const geometryKey = `${stateId}:${countyId}`;
-  const needGeometry = geometryKey !== currentGeometryKey;
-
+function startLoading() {
   loadButton.disabled = true;
   loadStatus.textContent = 'Carregando mapa...';
   loadStatus.dataset.state = 'loading';
-  const startTime = performance.now();
+  return performance.now();
+}
+
+function finishLoading(startTime, text) {
+  const seconds = ((performance.now() - startTime) / 1000).toFixed(1);
+  loadStatus.textContent = `${text} em ${seconds} seg`;
+  loadStatus.dataset.state = 'ok';
+}
+
+// --- Whole country (Brasil) ------------------------------------------------------
+// Values for the whole country are too slow to read per request (~200 s:
+// `value` is stored grouped by tract), so the server precomputes, per
+// indicator, a "class string": character i is the legend item of the i-th
+// tract in the id list from /api/brasil/ids ("-" = no value).
+
+let brasilIdsRequest = null;
+
+function getBrasilIds() {
+  if (!brasilIdsRequest) {
+    brasilIdsRequest = apiFetch('/api/brasil/ids').then(({ data, sql }) => {
+      // Delta-encoded: first id, then differences.
+      const ids = new Array(data.deltas.length);
+      let id = 0;
+      data.deltas.forEach((d, i) => { ids[i] = id += d; });
+      return { ids, version: data.version, sql };
+    });
+    brasilIdsRequest.catch(() => { brasilIdsRequest = null; });
+  }
+  return brasilIdsRequest;
+}
+
+async function loadBrasilMap(startTime) {
+  const indicatorId = indicatorSelect.value;
+  const classesUrl = `/api/brasil/classes?indicator_id=${encodeURIComponent(indicatorId)}`;
+  const legendUrl = `/api/legend?indicator_id=${encodeURIComponent(indicatorId)}`;
+  const [ids, classes, legend, readyMap] = await Promise.all([
+    getBrasilIds(),
+    apiFetch(classesUrl),
+    apiFetch(legendUrl),
+    ensureMap()
+  ]);
+  if (classes.data.version !== ids.version) {
+    // The server's tract list changed since the ids were loaded.
+    brasilIdsRequest = null;
+    throw new Error('lista de setores desatualizada; tente novamente');
+  }
+  if (debugCheckbox.checked) {
+    appendDebugSql('GET /api/brasil/ids', ids.sql || ['-- (carregada com o Debug desligado)']);
+    appendDebugSql(`GET ${classesUrl}`, classes.sql);
+    appendDebugSql(`GET ${legendUrl}`, legend.sql);
+  }
+
+  const colors = legend.data.map((item) => item.color);
+  const str = classes.data.classes;
+  const states = [];
+  for (let i = 0; i < str.length; i++) {
+    const c = str.charCodeAt(i) - 48; // '0' -> 0; '-' -> negative
+    if (c >= 0) states.push([ids.ids[i], { c, color: colors[c] }]);
+  }
+  paintTracts(readyMap, states);
+  renderLegend(indicatorSelect.selectedOptions[0].textContent, legend.data);
+  if (currentAreaKey !== 'BR') readyMap.fitBounds(BRAZIL_BOUNDS, { padding: 20, duration: 500 });
+  currentAreaKey = 'BR';
+  finishLoading(startTime, `${states.length.toLocaleString('pt-BR')} setores (Brasil)`);
+}
+
+// --- State / municipality ----------------------------------------------------------
+
+async function loadAreaMap(startTime) {
+  const scope = areaParams();
+  const valueParams = new URLSearchParams(scope);
+  valueParams.set('indicator_id', indicatorSelect.value);
+  const valuesUrl = `/api/values?${valueParams.toString()}`;
+  const legendUrl = `/api/legend?indicator_id=${encodeURIComponent(indicatorSelect.value)}`;
+  const [bounds, values, legend, readyMap] = await Promise.all([
+    getBounds(scope),
+    apiFetch(valuesUrl),
+    apiFetch(legendUrl),
+    ensureMap()
+  ]);
+  if (debugCheckbox.checked) {
+    appendDebugSql(`GET ${bounds.url}`, bounds.sql || ['-- (carregados com o Debug desligado)']);
+    appendDebugSql(`GET ${valuesUrl}`, values.sql);
+    appendDebugSql(`GET ${legendUrl}`, legend.sql);
+  }
+
+  const rows = values.data;
+  paintTracts(readyMap, rows.map((row) => [row.geoobject_id, { color: row.color, value: row.value }]));
+  renderLegend(indicatorSelect.selectedOptions[0].textContent, legend.data);
+  const areaKey = scope.toString();
+  if (areaKey !== currentAreaKey && bounds.data) {
+    readyMap.fitBounds(bounds.data, { padding: 40, duration: 500 });
+  }
+  currentAreaKey = areaKey;
+  finishLoading(startTime, `${rows.length.toLocaleString('pt-BR')} setores`);
+}
+
+async function loadMapData() {
+  const startTime = startLoading();
   try {
-    const valuesUrl = `/api/values?${valueParams.toString()}`;
-    const legendUrl = `/api/legend?indicator_id=${encodeURIComponent(indicatorSelect.value)}`;
-    const [geometry, values, legend, readyMap] = await Promise.all([
-      needGeometry ? getGeometry(scope) : null,
-      apiFetch(valuesUrl),
-      apiFetch(legendUrl),
-      ensureMap()
-    ]);
-    const rows = values.data;
-
-    if (needGeometry) currentGeometryDebug = { url: geometry.url, sql: geometry.sql };
-    if (debugCheckbox.checked) {
-      // Polygons first, then values -- the order the map uses them.
-      const g = currentGeometryDebug;
-      const note = needGeometry
-        ? '-- polígonos (baixados ao escolher a área ou agora)'
-        : '-- polígonos já exibidos no mapa; nenhuma requisição nova. Consulta que os gerou:';
-      appendDebugSql(`GET ${g ? g.url : '/api/geometry'}`, [
-        note,
-        ...((g && g.sql) || ['-- (carregados com o Debug desligado; recarregue a área para ver o SQL)'])
-      ]);
-      appendDebugSql(`GET ${valuesUrl}`, values.sql);
-      appendDebugSql(`GET ${legendUrl}`, legend.sql);
-    }
-
-    if (needGeometry) {
-      const geojson = geometry.data;
-      readyMap.getSource('geoobjects').setData(geojson);
-      currentGeometryKey = geometryKey;
-      currentBounds = computeBounds(geojson);
-    }
-    applyValues(readyMap, rows);
-    renderLegend(indicatorSelect.selectedOptions[0].textContent, legend.data);
-
-    if (needGeometry && currentBounds) {
-      readyMap.fitBounds(currentBounds, { padding: 40, duration: 500 });
-    }
-
-    const seconds = ((performance.now() - startTime) / 1000).toFixed(1);
-    loadStatus.textContent = `${rows.length} polígonos carregados em ${seconds} seg`;
-    loadStatus.dataset.state = 'ok';
+    await (isBrasil() ? loadBrasilMap(startTime) : loadAreaMap(startTime));
   } catch (err) {
     loadStatus.textContent = 'Erro ao carregar o mapa';
     loadStatus.dataset.state = 'error';
