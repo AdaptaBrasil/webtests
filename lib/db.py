@@ -156,6 +156,9 @@ def fetch_values(indicator_id, state_id, county_id=None):
     probes walk value_geoobject_covering_idx (geoobject_id, indicator_id,
     year) INCLUDE (value) front to back: with hash order (`IN (...)`) each
     probe was a random read, ~10 ms apiece on this server when cold.
+    `offset 0` keeps the planner from flattening the LATERAL subquery into a
+    plain join: for big states (SP) it would otherwise hash-join against all
+    of the indicator's rows nationwide, read from the table (~200 s cold).
     """
     schema = get_schema()
     where, params = _scope_filter(state_id, county_id, "g")
@@ -170,6 +173,7 @@ def fetch_values(indicator_id, state_id, county_id=None):
         f"    select v.geoobject_id, v.value from {schema}.value v "
         f"    where v.geoobject_id = objs.id "
         f"      and v.indicator_id = :indicator_id and v.year < 2027"
+        f"    offset 0"
         f"  ) v"
         f") "
         f"select vals.geoobject_id, vals.value, li.color from vals "
@@ -220,6 +224,7 @@ def warm_values(state_id, county_id=None):
             f"select count(v.value) from objs cross join lateral ("
             f"  select v.value from {schema}.value v "
             f"  where v.geoobject_id = objs.id and v.year < 2027"
+            f"  offset 0"
             f") v"
         )
         with get_engine().connect() as conn:
