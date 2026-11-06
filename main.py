@@ -108,6 +108,11 @@ def api_values(
     return db.fetch_values(indicator_id, state_id, county_id)
 
 
+@app.get("/api/legend")
+def api_legend(indicator_id: int = Query(...)):
+    return db.fetch_legend(indicator_id)
+
+
 @app.post("/api/warm", status_code=202)
 def api_warm(
     background_tasks: BackgroundTasks,

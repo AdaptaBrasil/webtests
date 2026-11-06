@@ -4,6 +4,9 @@ const stateSelect = document.getElementById('state');
 const countySelect = document.getElementById('county');
 const loadButton = document.getElementById('loadMap');
 const loadStatus = document.getElementById('loadStatus');
+const legendBox = document.getElementById('legend');
+const legendTitle = document.getElementById('legendTitle');
+const legendItems = document.getElementById('legendItems');
 const debugCheckbox = document.getElementById('debug');
 const debugPanel = document.getElementById('debugPanel');
 const debugSql = document.getElementById('debugSql');
@@ -228,7 +231,7 @@ function ensureMap() {
 
   map.addControl(new maplibregl.NavigationControl(), 'top-right');
 
-  const popup = new maplibregl.Popup({ closeButton: false, closeOnClick: false });
+  const popup = new maplibregl.Popup({ closeButton: false, closeOnClick: false, offset: 12, className: 'geo-tip' });
 
   // Polygons are drawn from the geometry source; their color and visibility
   // come from per-feature state set by applyValues(), so switching indicators
@@ -248,7 +251,12 @@ function ensureMap() {
         source: 'geoobjects',
         paint: {
           'fill-color': ['coalesce', ['feature-state', 'color'], '#888888'],
-          'fill-opacity': ['case', hasValue, 0.75, 0]
+          'fill-opacity': [
+            'case',
+            ['!', hasValue], 0,
+            ['boolean', ['feature-state', 'hover'], false], 0.95,
+            0.78
+          ]
         }
       });
       map.addLayer({
@@ -256,30 +264,43 @@ function ensureMap() {
         type: 'line',
         source: 'geoobjects',
         paint: {
-          'line-color': '#222222',
-          'line-width': 0.6,
+          'line-color': ['case', ['boolean', ['feature-state', 'hover'], false], '#0b3d2e', '#2b2b2b'],
+          'line-width': ['case', ['boolean', ['feature-state', 'hover'], false], 2.2, 0.5],
           'line-opacity': ['case', hasValue, 1, 0]
         }
       });
 
+      let hoveredId = null;
+      const setHover = (id) => {
+        if (hoveredId === id) return;
+        if (hoveredId != null) map.setFeatureState({ source: 'geoobjects', id: hoveredId }, { hover: false });
+        hoveredId = id;
+        if (id != null) map.setFeatureState({ source: 'geoobjects', id }, { hover: true });
+      };
+
       map.on('mousemove', 'geovalue-fill', (e) => {
         const feature = e.features.find((f) => currentValues.has(f.id));
         if (!feature) {
+          setHover(null);
           map.getCanvas().style.cursor = '';
           popup.remove();
           return;
         }
+        setHover(feature.id);
         map.getCanvas().style.cursor = 'pointer';
         const { county_name, name } = feature.properties;
-        const { value } = currentValues.get(feature.id);
-        const html = [
-          `<strong>Município:</strong> ${county_name}`,
-          `<strong>Nome:</strong> ${name}`,
-          `<strong>Valor:</strong> ${value == null ? '—' : Number(value).toFixed(4)}`
-        ].join('<br>');
+        const { value, color } = currentValues.get(feature.id);
+        const html = `
+          <div class="tip-title">${name}</div>
+          <div class="tip-sub">${county_name}</div>
+          <div class="tip-value">
+            <span class="tip-dot" style="background:${color || '#dcdcdc'}"></span>
+            ${value == null ? 'Dado indisponível' : Number(value).toFixed(4)}
+          </div>`;
         popup.setLngLat(e.lngLat).setHTML(html).addTo(map);
       });
       map.on('mouseleave', 'geovalue-fill', () => {
+        setHover(null);
         map.getCanvas().style.cursor = '';
         popup.remove();
       });
@@ -299,6 +320,37 @@ let currentGeometryDebug = null;
 let currentBounds = null;
 // geoobject_id -> {value, color} row for the indicator currently shown.
 let currentValues = new Map();
+
+// Legend ranges in Brazilian format, as AdaptaBrasil shows them: "0,00 a 0,19".
+const rangeFormat = new Intl.NumberFormat('pt-BR', {
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 2
+});
+
+function renderLegend(title, items) {
+  legendTitle.textContent = title;
+  legendItems.replaceChildren(
+    ...items.map((item) => {
+      const row = document.createElement('div');
+      row.className = 'legend-row';
+      const swatch = document.createElement('span');
+      swatch.className = 'legend-swatch';
+      swatch.style.background = item.color;
+      const label = document.createElement('span');
+      label.className = 'legend-label';
+      label.textContent = item.label;
+      row.append(swatch, label);
+      if (item.minvalue != null && item.maxvalue != null) {
+        const range = document.createElement('span');
+        range.className = 'legend-range';
+        range.textContent = `${rangeFormat.format(item.minvalue)} a ${rangeFormat.format(item.maxvalue)}`;
+        row.append(range);
+      }
+      return row;
+    })
+  );
+  legendBox.hidden = items.length === 0;
+}
 
 function applyValues(readyMap, rows) {
   readyMap.removeFeatureState({ source: 'geoobjects' });
@@ -324,12 +376,15 @@ async function loadMapData() {
 
   loadButton.disabled = true;
   loadStatus.textContent = 'Carregando mapa...';
+  loadStatus.dataset.state = 'loading';
   const startTime = performance.now();
   try {
     const valuesUrl = `/api/values?${valueParams.toString()}`;
-    const [geometry, values, readyMap] = await Promise.all([
+    const legendUrl = `/api/legend?indicator_id=${encodeURIComponent(indicatorSelect.value)}`;
+    const [geometry, values, legend, readyMap] = await Promise.all([
       needGeometry ? getGeometry(scope) : null,
       apiFetch(valuesUrl),
+      apiFetch(legendUrl),
       ensureMap()
     ]);
     const rows = values.data;
@@ -346,6 +401,7 @@ async function loadMapData() {
         ...((g && g.sql) || ['-- (carregados com o Debug desligado; recarregue a área para ver o SQL)'])
       ]);
       appendDebugSql(`GET ${valuesUrl}`, values.sql);
+      appendDebugSql(`GET ${legendUrl}`, legend.sql);
     }
 
     if (needGeometry) {
@@ -355,6 +411,7 @@ async function loadMapData() {
       currentBounds = computeBounds(geojson);
     }
     applyValues(readyMap, rows);
+    renderLegend(indicatorSelect.selectedOptions[0].textContent, legend.data);
 
     if (needGeometry && currentBounds) {
       readyMap.fitBounds(currentBounds, { padding: 40, duration: 500 });
@@ -362,8 +419,10 @@ async function loadMapData() {
 
     const seconds = ((performance.now() - startTime) / 1000).toFixed(1);
     loadStatus.textContent = `${rows.length} polígonos carregados em ${seconds} seg`;
+    loadStatus.dataset.state = 'ok';
   } catch (err) {
     loadStatus.textContent = 'Erro ao carregar o mapa';
+    loadStatus.dataset.state = 'error';
     throw err;
   } finally {
     loadButton.disabled = false;

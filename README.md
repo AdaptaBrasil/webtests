@@ -73,6 +73,7 @@ the app on http://localhost:8000.
 | `GET /api/counties`    | `state_id`                                      | List counties for a state                      |
 | `GET /api/geometry`   | `state_id`, `county_id` (opt.)                  | GeoJSON `FeatureCollection` of the geoobjects' boundaries (feature `id` = geoobject id; `name`, `county_name` properties) |
 | `GET /api/values`     | `indicator_id`, `state_id`, `county_id` (opt.)  | Indicator values and legend colors (`geoobject_id`, `value`, `color`), no geometry |
+| `GET /api/legend`     | `indicator_id`                                  | The indicator's color legend (`label`, `color`, `minvalue`, `maxvalue`), in display order |
 | `POST /api/warm`      | `state_id`, `county_id` (opt.)                  | Reads the area's values in the background so later `/api/values` calls are fast; returns 202 immediately |
 
 Geometry and values are served separately: boundaries don't change between

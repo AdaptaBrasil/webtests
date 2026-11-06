@@ -205,6 +205,22 @@ def _geometry(state_id, county_id=None):
     return fc, render_sql(sql, params)
 
 
+def fetch_legend(indicator_id):
+    """Return the indicator's legend items (label, color, minvalue, maxvalue),
+    in display order. The last item is usually "Dado indisponível", with no
+    value range (minvalue/maxvalue null)."""
+    schema = get_schema()
+    sql = (
+        f"select li.label, li.color, li.minvalue, li.maxvalue "
+        f"from {schema}.legend_items li "
+        f"join {schema}.indicator i on i.legend_id = li.legend_id "
+        f'where i.id = :indicator_id order by li."order"'
+    )
+    df = query_df(sql, {"indicator_id": indicator_id})
+    # NaN isn't valid JSON; send missing range bounds as null.
+    return df.astype(object).where(df.notna(), None).to_dict(orient="records")
+
+
 def fetch_values(indicator_id, state_id, county_id=None):
     """Return the indicator's values and legend colors for a state or county,
     as rows of geoobject_id, value, color (no geometry or labels).

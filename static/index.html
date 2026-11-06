@@ -5,85 +5,357 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AdaptaBrasil - Mapa de Indicadores</title>
 <link href="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.css" rel="stylesheet">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-  html, body { margin: 0; height: 100%; font-family: system-ui, Arial, sans-serif; }
+  :root {
+    --green-900: #0b3d2e;
+    --green-700: #1e6f42;
+    --green-500: #2e9b5f;
+    --green-100: #e6f4ec;
+    --ink: #1f2933;
+    --muted: #6b7680;
+    --line: #e3e8ec;
+    --bg: #f5f7f8;
+    --card: #ffffff;
+    --radius: 12px;
+    --radius-sm: 8px;
+    --shadow: 0 1px 2px rgba(16, 24, 40, .06), 0 4px 14px rgba(16, 24, 40, .08);
+    --shadow-lg: 0 8px 30px rgba(16, 24, 40, .18);
+    --focus: 0 0 0 3px rgba(46, 155, 95, .25);
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    height: 100%;
+    font-family: Inter, system-ui, "Segoe UI", Arial, sans-serif;
+    color: var(--ink);
+    background: var(--bg);
+  }
   #app { display: flex; flex-direction: column; height: 100vh; }
+
+  /* ---- top bar ---------------------------------------------------------- */
+  #topbar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 20px;
+    background: linear-gradient(100deg, var(--green-900), var(--green-700) 60%, var(--green-500));
+    color: #fff;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, .15);
+    z-index: 3;
+  }
+  /* AdaptaBrasil mark on a white tile. The PNG is the site's full logo
+     (143x58, mark + "Adapta Brasil MCTI" text); only the colored mark
+     (x 3-46, y 0-45) is shown, scaled to 28px tall. */
+  #topbar .logo {
+    width: 38px;
+    height: 38px;
+    border-radius: 10px;
+    display: grid;
+    place-items: center;
+    background: #fff;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, .2);
+  }
+  #topbar .logo span {
+    width: 27px;
+    height: 28px;
+    background: url("/static/adaptabrasil-logo.png") -2px 0 / 87px auto no-repeat;
+  }
+  #topbar h1 { margin: 0; font-size: 17px; font-weight: 700; letter-spacing: .2px; }
+  #topbar h1 span { font-weight: 400; opacity: .8; }
+
+  /* ---- filters card ----------------------------------------------------- */
   #filters {
     display: flex;
     flex-direction: row;
     align-items: stretch;
     gap: 24px;
-    padding: 12px 16px;
-    background: #f4f4f4;
-    border-bottom: 1px solid #ddd;
+    margin: 12px 16px 0;
+    padding: 14px 18px;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    z-index: 2;
   }
   #filterFields { display: flex; flex-direction: column; gap: 12px; }
+  .filters-row { display: flex; align-items: flex-end; gap: 16px; flex-wrap: wrap; }
+  .field { display: flex; flex-direction: column; min-width: 220px; }
+  .field label {
+    font-size: 11px;
+    font-weight: 600;
+    margin-bottom: 5px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: .6px;
+  }
+  select {
+    appearance: none;
+    -webkit-appearance: none;
+    font: inherit;
+    font-size: 14px;
+    padding: 8px 34px 8px 12px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    background: #fff url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' fill='none' stroke='%236b7680' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") no-repeat right 12px center;
+    color: var(--ink);
+    cursor: pointer;
+    transition: border-color .15s, box-shadow .15s;
+  }
+  select:hover:not(:disabled) { border-color: #c5cdd3; }
+  select:focus { outline: none; border-color: var(--green-500); box-shadow: var(--focus); }
+  select:disabled { background-color: #f1f3f5; color: #9aa4ac; cursor: not-allowed; }
+
+  #loadMap {
+    font: inherit;
+    font-size: 14px;
+    font-weight: 600;
+    padding: 9px 22px;
+    border: none;
+    border-radius: 999px;
+    background: linear-gradient(135deg, var(--green-500), var(--green-700));
+    color: #fff;
+    cursor: pointer;
+    box-shadow: 0 3px 10px rgba(30, 111, 66, .35);
+    transition: transform .12s, box-shadow .12s, filter .12s;
+  }
+  #loadMap:hover:not(:disabled) {
+    transform: translateY(-1px);
+    box-shadow: 0 6px 16px rgba(30, 111, 66, .4);
+    filter: brightness(1.05);
+  }
+  #loadMap:active:not(:disabled) { transform: translateY(0); }
+  #loadMap:focus-visible { outline: none; box-shadow: var(--focus), 0 3px 10px rgba(30, 111, 66, .35); }
+  #loadMap:disabled { background: #c9d0d5; box-shadow: none; cursor: not-allowed; }
+
+  /* Debug checkbox drawn as a toggle switch. */
   .field.debug-toggle {
     flex-direction: row;
     align-items: center;
-    gap: 6px;
+    gap: 8px;
     min-width: 0;
+    align-self: center;
     font-size: 13px;
     font-weight: 600;
-    color: #333;
-    align-self: center;
+    color: var(--muted);
+    cursor: pointer;
+    user-select: none;
   }
-  #debugPanel { flex: 1; display: flex; flex-direction: column; gap: 4px; min-width: 300px; }
+  .debug-toggle input {
+    appearance: none;
+    -webkit-appearance: none;
+    margin: 0;
+    width: 34px;
+    height: 20px;
+    border-radius: 999px;
+    background: #cfd6db;
+    position: relative;
+    cursor: pointer;
+    transition: background .2s;
+  }
+  .debug-toggle input::after {
+    content: "";
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: #fff;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, .3);
+    transition: transform .2s;
+  }
+  .debug-toggle input:checked { background: var(--green-500); }
+  .debug-toggle input:checked::after { transform: translateX(14px); }
+  .debug-toggle input:focus-visible { outline: none; box-shadow: var(--focus); }
+
+  /* Status pill: spinner while loading, green when done, red on error. */
+  #loadStatus { font-size: 12.5px; color: var(--muted); align-self: center; }
+  #loadStatus[data-state] {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 5px 12px;
+    border-radius: 999px;
+    font-weight: 500;
+  }
+  #loadStatus[data-state="loading"] { background: #eef2f5; color: #48525b; }
+  #loadStatus[data-state="ok"] { background: var(--green-100); color: var(--green-700); }
+  #loadStatus[data-state="error"] { background: #fdecec; color: #b42318; }
+  #loadStatus[data-state="loading"]::before {
+    content: "";
+    width: 11px;
+    height: 11px;
+    border-radius: 50%;
+    border: 2px solid #b7c1c8;
+    border-top-color: var(--green-500);
+    animation: spin .7s linear infinite;
+  }
+  #loadStatus[data-state="ok"]::before { content: "✓"; font-weight: 700; }
+  #loadStatus[data-state="error"]::before { content: "!"; font-weight: 700; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ---- debug panel ------------------------------------------------------ */
+  #debugPanel { flex: 1; display: flex; flex-direction: column; gap: 6px; min-width: 300px; }
   #debugPanel[hidden] { display: none; }
   #debugPanel .debug-header {
     display: flex;
     align-items: center;
     gap: 8px;
-    font-size: 13px;
+    font-size: 11px;
     font-weight: 600;
-    color: #333;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: .6px;
   }
   #debugPanel .debug-header span { flex: 1; }
-  #debugPanel button { font-size: 12px; padding: 2px 10px; cursor: pointer; }
+  #debugPanel button {
+    font: inherit;
+    font-size: 12px;
+    text-transform: none;
+    letter-spacing: 0;
+    padding: 3px 12px;
+    cursor: pointer;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    background: #fff;
+    color: var(--ink);
+    transition: background .15s, border-color .15s;
+  }
+  #debugPanel button:hover { background: var(--green-100); border-color: var(--green-500); }
   #debugSql {
     flex: 1;
     min-height: 90px;
     resize: vertical;
-    font: 12px/1.4 Consolas, "Courier New", monospace;
+    font: 12px/1.5 "JetBrains Mono", Consolas, "Courier New", monospace;
     white-space: pre;
-    border: 1px solid #ccc;
-    border-radius: 4px;
-    padding: 6px 8px;
-    background: #fff;
+    border: 1px solid #1f2a33;
+    border-radius: var(--radius-sm);
+    padding: 8px 10px;
+    background: #111a21;
+    color: #cde7d6;
   }
-  .filters-row {
-    display: flex;
-    align-items: flex-end;
-    gap: 24px;
-    flex-wrap: wrap;
+  #debugSql:focus { outline: none; box-shadow: var(--focus); }
+
+  /* ---- map -------------------------------------------------------------- */
+  #mapWrap {
+    flex: 1;
+    position: relative;
+    margin: 12px 16px 16px;
+    border-radius: var(--radius);
+    overflow: hidden;
+    border: 1px solid var(--line);
+    box-shadow: var(--shadow);
+    background: #e9eef1;
   }
-  .field { display: flex; flex-direction: column; min-width: 220px; }
-  .field label { font-size: 13px; font-weight: 600; margin-bottom: 4px; color: #333; }
-  select {
-    font-size: 14px;
-    padding: 6px 8px;
-    border: 1px solid #ccc;
-    border-radius: 4px;
-    background: #fff;
+  #map { position: absolute; inset: 0; }
+  .maplibregl-ctrl-group {
+    border-radius: 10px !important;
+    overflow: hidden;
+    box-shadow: var(--shadow) !important;
   }
-  #loadMap {
-    font-size: 14px;
+
+  /* Color legend: frosted card, bottom-left over the map. */
+  #legend {
+    position: absolute;
+    left: 16px;
+    bottom: 20px;
+    z-index: 2;
+    width: 250px;
+    padding: 14px 16px 12px;
+    background: rgba(255, 255, 255, .82);
+    backdrop-filter: blur(10px) saturate(1.4);
+    -webkit-backdrop-filter: blur(10px) saturate(1.4);
+    border: 1px solid rgba(255, 255, 255, .7);
+    border-radius: 14px;
+    box-shadow: var(--shadow-lg);
+    font-size: 13px;
+    animation: rise .25s ease-out;
+  }
+  #legend[hidden] { display: none; }
+  @keyframes rise {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: none; }
+  }
+  #legend .legend-title {
+    font-size: 13.5px;
+    font-weight: 700;
+    line-height: 1.3;
+    padding-left: 10px;
+    border-left: 3px solid var(--green-500);
+  }
+  #legend .legend-subtitle {
+    display: inline-block;
+    margin: 8px 0 10px;
+    padding: 2px 9px;
+    border-radius: 999px;
+    background: var(--green-100);
+    color: var(--green-700);
+    font-size: 11px;
     font-weight: 600;
-    padding: 8px 22px;
-    border: none;
-    border-radius: 4px;
-    background: #1e6f42;
-    color: #fff;
-    cursor: pointer;
+    letter-spacing: .4px;
+    text-transform: uppercase;
   }
-  #loadMap:disabled { background: #a9a9a9; cursor: not-allowed; }
-  #loadStatus { font-size: 13px; color: #555; align-self: center; }
-  #map { flex: 1; width: 100%; }
-  .maplibregl-popup-content { font-size: 13px; padding: 8px 10px; }
+  #legend .legend-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 4px 6px;
+    margin: 0 -6px;
+    border-radius: 8px;
+    transition: background .15s;
+  }
+  #legend .legend-row:hover { background: rgba(0, 0, 0, .05); }
+  #legend .legend-swatch {
+    width: 22px;
+    height: 14px;
+    flex: none;
+    border-radius: 5px;
+    box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .12);
+  }
+  #legend .legend-label { flex: 1; font-weight: 500; }
+  #legend .legend-range {
+    color: var(--muted);
+    font-size: 12px;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Hover tooltip over the polygons. */
+  .geo-tip .maplibregl-popup-content {
+    padding: 10px 12px;
+    border-radius: 10px;
+    box-shadow: var(--shadow-lg);
+    font-size: 13px;
+    min-width: 160px;
+  }
+  .geo-tip .tip-title { font-weight: 700; }
+  .geo-tip .tip-sub { color: var(--muted); font-size: 12px; margin-top: 1px; }
+  .geo-tip .tip-value {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    margin-top: 8px;
+    padding-top: 7px;
+    border-top: 1px solid var(--line);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+  .geo-tip .tip-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .15);
+  }
 </style>
 </head>
 <body>
 <div id="app">
+  <header id="topbar">
+    <div class="logo" role="img" aria-label="AdaptaBrasil"><span></span></div>
+    <h1>AdaptaBrasil <span>· Mapa de Indicadores</span></h1>
+  </header>
   <div id="filters">
    <div id="filterFields">
     <div class="filters-row">
@@ -125,7 +397,14 @@
       <textarea id="debugSql" readonly spellcheck="false"></textarea>
     </div>
   </div>
-  <div id="map"></div>
+  <div id="mapWrap">
+    <div id="map"></div>
+    <div id="legend" hidden>
+      <div class="legend-title" id="legendTitle"></div>
+      <div class="legend-subtitle">Presente</div>
+      <div id="legendItems"></div>
+    </div>
+  </div>
 </div>
 <script src="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.js"></script>
 <script src="/static/app.js"></script>
