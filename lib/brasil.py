@@ -50,13 +50,17 @@ BOUNDARY_TILES_TABLE = "webtests_boundary_tiles"
 # tracts are drawn with similar household counts, so this is close to a
 # population-weighted mean; an area-weighted one lets near-empty rural
 # tracts dominate and hides cities -- Sao Paulo's density 0.29 vs 0.72).
-# At those zooms
-# most tracts are smaller than a pixel and are drawn as 2px squares colored
-# by the biggest tract of each cell, which hides cities (dense, tiny tracts)
-# and speckles the map wherever a big tract has no data.
+# At those zooms most tracts are smaller than a pixel and are drawn as 2px
+# squares colored by the biggest tract of each cell, which hides cities
+# (dense, tiny tracts) and speckles the map wherever a big tract has no data.
 COUNTY_CLASSES_TABLE = "webtests_county_classes"
 COUNTY_TILES_TABLE = "webtests_county_tiles"
-COUNTY_FILL_MAX_ZOOM = 8
+# Default switch zoom; the map's zoom box lets you try others.
+COUNTY_FILL_MAX_ZOOM = 5
+# Municipality tiles are built up to this zoom, independently of the
+# switch, so a switch tried up to COUNTY_TILES_MAX_ZOOM + 1 still gets
+# full-detail borders (beyond, the map overzooms these tiles).
+COUNTY_TILES_MAX_ZOOM = 7
 
 # Boundary lines (their own tiles, drawn over the tract colors).
 STATE_TYPE_ID = 4
@@ -481,7 +485,7 @@ TILE_TABLES = {"tracts": TILES_TABLE, "boundaries": BOUNDARY_TILES_TABLE,
 # table) or they keep showing the old tiles.
 TILE_VERSIONS = {"tracts": 1, "boundaries": 1, "counties": 2}
 # Highest zoom each set is built for (the map overzooms beyond it).
-TILE_MAX_ZOOM = {"tracts": MAX_ZOOM, "boundaries": MAX_ZOOM, "counties": COUNTY_FILL_MAX_ZOOM - 1}
+TILE_MAX_ZOOM = {"tracts": MAX_ZOOM, "boundaries": MAX_ZOOM, "counties": COUNTY_TILES_MAX_ZOOM}
 
 
 def build_tile(z, x, y, kind="tracts"):
@@ -527,6 +531,7 @@ def tiles_config():
         # Country map: municipalities (their own tiles, up to this zoom - 1)
         # below this zoom, tracts from it on.
         "county_fill_maxzoom": COUNTY_FILL_MAX_ZOOM,
+        "county_tiles_maxzoom": COUNTY_TILES_MAX_ZOOM,
         "versions": TILE_VERSIONS,
     }
 

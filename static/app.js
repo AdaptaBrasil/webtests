@@ -151,7 +151,7 @@ const TRACTS = { source: 'tracts', sourceLayer: 'tracts' };
 const COUNTIES = { source: 'counties', sourceLayer: 'counties' };
 // Country map: municipalities below this zoom, tracts from it on (set from
 // /api/tiles/config).
-let countyFillMaxZoom = 8;
+let countyFillMaxZoom = 5;
 const BRAZIL_BOUNDS = [[-74.0, -33.8], [-34.7, 5.3]];
 
 function areaParams() {
@@ -328,7 +328,8 @@ function ensureMap() {
         updateZoomBox();
         map.addSource('counties', {
           ...tileSource('/api/municipalities', 'counties'),
-          maxzoom: countyFillMaxZoom - 1
+          // Built up to here regardless of the switch zoom (see the zoom box).
+          maxzoom: config.county_tiles_maxzoom
         });
       } catch (err) {
         reject(err);

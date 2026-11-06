@@ -120,7 +120,7 @@ slow to read per request, so the country map's colors come from:
   the legend item of every tract (~8 KB gzipped), applied to the tiles'
   features as MapLibre feature-state.
 - **Municipality classes**, one set per indicator, stored in
-  `webtests_county_classes`. Below zoom 8 (`COUNTY_FILL_MAX_ZOOM`) the country
+  `webtests_county_classes`. Below zoom 5 (`COUNTY_FILL_MAX_ZOOM`) the country
   map shows the 5,570 municipalities (tiles `/api/municipalities/...`, table
   `webtests_county_tiles`) instead of tracts, each colored by the **mean of its
   tracts' values** (one weight per tract; tracts have similar household counts,
